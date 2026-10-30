@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>particle grid — 2026-10-29</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; }
+  .label {
+    position: fixed; left: 16px; top: 14px; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+</style>
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-10-29 / particle grid</div>
+<script type="module">
+// A sprung grid of points pushed around by the cursor. Points brighten and
+// grow with displacement; only the most disturbed ones turn red. Click to
+// send a shockwave. With no cursor around, a ghost cursor drifts through.
+import * as THREE from 'three';
+
+const GAP = 16;          // grid spacing, px
+const RADIUS = 170;      // cursor influence radius, px
+const PUSH = 1.6;        // cursor repulsion strength
+const SPRING = 0.022;
+const DAMP = 0.86;
+const MAX_DISP = 40;     // displacement that maps to full energy
+const IDLE_MS = 2500;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10, 10);
+
+const material = new THREE.ShaderMaterial({
+  transparent: true,
+  depthTest: false,
+  uniforms: { uPR: { value: renderer.getPixelRatio() } },
+  vertexShader: /* glsl */`
+    attribute float aEnergy;
+    uniform float uPR;
+    varying float vE;
+    void main() {
+      vE = aEnergy;
+      gl_PointSize = (3.0 + aEnergy * aEnergy * 4.5) * uPR;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */`
+    varying float vE;
+    void main() {
+      float d = length(gl_PointCoord - 0.5);
+      float alpha = smoothstep(0.5, 0.25, d);
+      vec3 grey = vec3(0.32 + 0.68 * smoothstep(0.0, 0.35, vE));
+      vec3 red = vec3(1.0, 0.165, 0.12);
+      vec3 col = mix(grey, red, smoothstep(0.8, 0.95, vE));
+      gl_FragColor = vec4(col, alpha);
+    }`,
+});
+
+let points, rest, pos, vel, energy, count = 0;
+let W = 0, H = 0;
+
+function build() {
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H);
+  camera.left = -W / 2; camera.right = W / 2;
+  camera.top = H / 2; camera.bottom = -H / 2;
+  camera.updateProjectionMatrix();
+
+  const cols = Math.floor(W / GAP), rows = Math.floor(H / GAP);
+  const ox = -((cols - 1) * GAP) / 2, oy = -((rows - 1) * GAP) / 2;
+  count = cols * rows;
+  rest = new Float32Array(count * 2);
+  vel = new Float32Array(count * 2);
+  pos = new Float32Array(count * 3);
+  energy = new Float32Array(count);
+  for (let j = 0, k = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++, k++) {
+      rest[k * 2] = pos[k * 3] = ox + i * GAP;
+      rest[k * 2 + 1] = pos[k * 3 + 1] = oy + j * GAP;
+    }
+  }
+
+  if (points) { scene.remove(points); points.geometry.dispose(); }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('aEnergy', new THREE.BufferAttribute(energy, 1).setUsage(THREE.DynamicDrawUsage));
+  points = new THREE.Points(geo, material);
+  points.frustumCulled = false;
+  scene.add(points);
+}
+addEventListener('resize', build);
+build();
+
+// Cursor in centred, y-up coordinates.
+const pointer = { x: 0, y: 0, last: -Infinity, inside: false };
+const cursor = { x: 0, y: 0 };
+const waves = [];
+
+function toWorld(e) { return { x: e.clientX - W / 2, y: H / 2 - e.clientY }; }
+addEventListener('pointermove', (e) => {
+  Object.assign(pointer, toWorld(e), { last: performance.now(), inside: true });
+});
+document.documentElement.addEventListener('pointerleave', () => (pointer.inside = false));
+addEventListener('pointerdown', (e) => {
+  waves.push({ ...toWorld(e), t0: performance.now() });
+});
+
+function step(now) {
+  const idle = !pointer.inside || now - pointer.last > IDLE_MS;
+  const s = now / 1000;
+  const tx = idle ? Math.sin(s * 0.53) * W * 0.32 : pointer.x;
+  const ty = idle ? Math.sin(s * 0.71 + 1.1) * H * 0.3 : pointer.y;
+  const ease = idle ? 0.04 : 0.35;
+  cursor.x += (tx - cursor.x) * ease;
+  cursor.y += (ty - cursor.y) * ease;
+
+  const diag = Math.hypot(W, H);
+  for (let w = waves.length - 1; w >= 0; w--) {
+    waves[w].r = (now - waves[w].t0) * 0.9;
+    if (waves[w].r > diag) waves.splice(w, 1);
+  }
+
+  const R2 = RADIUS * RADIUS;
+  for (let k = 0; k < count; k++) {
+    const px = pos[k * 3], py = pos[k * 3 + 1];
+    let vx = vel[k * 2], vy = vel[k * 2 + 1];
+
+    const dx = px - cursor.x, dy = py - cursor.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < R2) {
+      const d = Math.sqrt(d2) + 1e-3;
+      const f = (1 - d / RADIUS) ** 2 * PUSH;
+      vx += (dx / d) * f; vy += (dy / d) * f;
+    }
+
+    for (const wv of waves) {
+      const wx = rest[k * 2] - wv.x, wy = rest[k * 2 + 1] - wv.y;
+      const d = Math.hypot(wx, wy) + 1e-3;
+      const band = Math.abs(d - wv.r);
+      if (band < 30) {
+        const f = (1 - band / 30) * 2.4 * (1 - wv.r / diag);
+        vx += (wx / d) * f; vy += (wy / d) * f;
+      }
+    }
+
+    const ex = rest[k * 2] - px, ey = rest[k * 2 + 1] - py;
+    vx = (vx + ex * SPRING) * DAMP;
+    vy = (vy + ey * SPRING) * DAMP;
+    pos[k * 3] = px + vx;
+    pos[k * 3 + 1] = py + vy;
+    vel[k * 2] = vx; vel[k * 2 + 1] = vy;
+    energy[k] = Math.min(1, Math.hypot(ex, ey) / MAX_DISP);
+  }
+  points.geometry.attributes.position.needsUpdate = true;
+  points.geometry.attributes.aEnergy.needsUpdate = true;
+}
+
+renderer.setAnimationLoop((now) => {
+  step(now);
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

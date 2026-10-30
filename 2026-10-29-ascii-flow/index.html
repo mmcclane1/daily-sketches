@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ascii flow — 2026-10-29</title>
+<link rel="icon" href="data:,">
+<script src="https://cdn.jsdelivr.net/npm/p5@1.11.13/lib/p5.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  .label {
+    position: fixed; left: 16px; top: 14px; padding: 2px 6px; background: #000; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+</style>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-10-29 / ascii flow</div>
+<script>
+// A Perlin flow field rendered as text. Each cell's glyph shows the local
+// direction, its brightness the local strength. One red tracer rides the
+// field. The cursor stirs a vortex; click to reseed.
+const CW = 12, CH = 20;                   // cell size in px
+const GLYPHS = ['-', '\\', '|', '/'];     // 0°, 45°, 90°, 135° (y points down)
+const LEVELS = 6;                         // brightness buckets, batched per fillStyle
+const TRAIL = 70;
+const RED = '#ff2a1f';
+const FONT = '15px ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+
+let cols, rows, t = 0;
+let tracer, trail = [];
+let mouseActive = false;
+
+function setup() {
+  const cnv = createCanvas(windowWidth, windowHeight);
+  cnv.mouseOut(() => (mouseActive = false));
+  pixelDensity(Math.min(2, displayDensity()));
+  noiseDetail(3, 0.5);
+  layout();
+  spawn();
+}
+
+function layout() {
+  cols = Math.ceil(width / CW);
+  rows = Math.ceil(height / CH);
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  layout();
+  spawn();
+}
+
+function spawn() {
+  tracer = { x: random(width * 0.2, width * 0.8), y: random(height * 0.2, height * 0.8), born: millis() };
+  trail = [];
+}
+
+function angleAt(px, py) {
+  let a = noise(px * 0.0022, py * 0.0022, t) * TWO_PI * 2;
+  if (mouseActive) {
+    const dx = px - mouseX, dy = py - mouseY;
+    const d = Math.hypot(dx, dy), R = 220;
+    if (d < R) {
+      const w = (1 - d / R) ** 2;
+      const swirl = Math.atan2(dy, dx) + HALF_PI;
+      a += Math.atan2(Math.sin(swirl - a), Math.cos(swirl - a)) * w;
+    }
+  }
+  return a;
+}
+
+function strengthAt(px, py) {
+  return noise(px * 0.0035 + 91, py * 0.0035 + 37, t * 0.6);
+}
+
+function glyphFor(a) {
+  const k = ((Math.round(a / QUARTER_PI) % 4) + 4) % 4;
+  return GLYPHS[k];
+}
+
+function draw() {
+  t += 0.0035;
+
+  // Advance the tracer along the field.
+  const a = angleAt(tracer.x, tracer.y);
+  tracer.x += Math.cos(a) * 3.2;
+  tracer.y += Math.sin(a) * 3.2;
+  const c = Math.floor(tracer.x / CW), r = Math.floor(tracer.y / CH);
+  const head = trail[0];
+  if (!head || head.c !== c || head.r !== r) trail.unshift({ c, r });
+  if (trail.length > TRAIL) trail.length = TRAIL;
+  const out = tracer.x < -CW || tracer.y < -CH || tracer.x > width + CW || tracer.y > height + CH;
+  if (out || millis() - tracer.born > 14000) spawn();
+
+  const red = new Map();
+  trail.forEach((p, i) => red.set(p.r * cols + p.c, 1 - i / TRAIL));
+
+  const ctx = drawingContext;
+  background(0);
+  ctx.font = FONT;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  const buckets = Array.from({ length: LEVELS }, () => []);
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      if (red.has(j * cols + i)) continue;
+      const px = i * CW + CW / 2, py = j * CH + CH / 2;
+      const m = strengthAt(px, py);
+      if (m < 0.36) continue;
+      const g = m < 0.45 ? '.' : glyphFor(angleAt(px, py));
+      const lvl = Math.min(LEVELS - 1, Math.floor(((m - 0.36) / 0.36) * LEVELS));
+      buckets[lvl].push(g, px, py);
+    }
+  }
+  buckets.forEach((b, lvl) => {
+    const v = Math.round(55 + (200 * lvl) / (LEVELS - 1));
+    ctx.fillStyle = `rgb(${v},${v},${v})`;
+    for (let k = 0; k < b.length; k += 3) ctx.fillText(b[k], b[k + 1], b[k + 2]);
+  });
+
+  ctx.fillStyle = RED;
+  trail.forEach((p, i) => {
+    const px = p.c * CW + CW / 2, py = p.r * CH + CH / 2;
+    ctx.globalAlpha = 1 - i / TRAIL;
+    ctx.fillText(i === 0 ? '*' : glyphFor(angleAt(px, py)), px, py);
+  });
+  ctx.globalAlpha = 1;
+}
+
+function mouseMoved() {
+  mouseActive = true;
+}
+
+function mousePressed() {
+  noiseSeed(Math.floor(random(1e9)));
+  spawn();
+}
+</script>
+</body>
+</html>

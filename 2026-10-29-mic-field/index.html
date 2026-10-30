@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mic field — 2026-10-29</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+  .label, #hint {
+    position: fixed; font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label { left: 16px; top: 14px; color: #666; }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+  #hint { left: 0; right: 0; bottom: 28px; text-align: center; color: #fff; letter-spacing: .35em; transition: opacity 1.2s; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas></canvas>
+<div class="label"><a href="../index.html">←</a> 2026-10-29 / mic field</div>
+<div id="hint">click to listen</div>
+<script>
+// Audio-reactive waveform field. Each row is one snapshot of the mic's
+// time-domain signal; rows scroll upward and occlude each other like a
+// ridge plot. The newest row is the only red line.
+const canvas = document.querySelector('canvas');
+const ctx = canvas.getContext('2d');
+const hint = document.getElementById('hint');
+
+const ROWS = 52;        // rows of history on screen
+const PTS = 200;        // points per row
+const ROW_MS = 40;      // ms between new rows
+const RED = '#ff2a1f';
+
+let W = 0, H = 0;
+let analyser = null, buf = null, peak = 0.05;
+let lastRow = 0;
+const rows = [];
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+// Before the mic is live (or if it's refused) draw a breathing synthetic signal.
+function synthRow(t) {
+  const row = new Float32Array(PTS);
+  const swell = 0.35 + 0.25 * Math.sin(t * 0.41) + 0.4 * Math.max(0, Math.sin(t * 1.3)) ** 12;
+  for (let j = 0; j < PTS; j++) {
+    const x = j / (PTS - 1);
+    row[j] = swell * (
+      0.55 * Math.sin(x * 19 + t * 2.3) +
+      0.30 * Math.sin(x * 47 - t * 3.1) * Math.sin(t * 0.7) +
+      0.15 * Math.sin(x * 131 + t * 7.0)
+    );
+  }
+  return row;
+}
+
+function micRow() {
+  analyser.getFloatTimeDomainData(buf);
+  // Trigger on a rising zero crossing so periodic sounds stand still.
+  const span = buf.length >> 1;
+  let start = 0;
+  for (let i = 1; i < span; i++) if (buf[i - 1] < 0 && buf[i] >= 0) { start = i; break; }
+  const row = new Float32Array(PTS);
+  let m = 0;
+  for (let j = 0; j < PTS; j++) {
+    const v = buf[start + Math.floor(j / (PTS - 1) * (span - 1))];
+    row[j] = v;
+    m = Math.max(m, Math.abs(v));
+  }
+  // Slow auto-gain: quiet rooms still move, loud ones don't clip.
+  peak = Math.max(m, peak * 0.985, 0.04);
+  for (let j = 0; j < PTS; j++) row[j] /= peak;
+  return row;
+}
+
+function envelope(x) {
+  const centre = Math.exp(-(((x - 0.5) / 0.2) ** 2));
+  return Math.sin(Math.PI * x) ** 2 * (0.12 + 0.88 * centre);
+}
+const ENV = Float32Array.from({ length: PTS }, (_, j) => envelope(j / (PTS - 1)));
+
+function frame(now) {
+  if (now - lastRow > ROW_MS || rows.length === 0) {
+    rows.unshift(analyser ? micRow() : synthRow(now / 1000));
+    if (rows.length > ROWS) rows.length = ROWS;
+    lastRow = now;
+  }
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  const left = W * 0.14, right = W * 0.86;
+  const top = H * 0.2, bottom = H * 0.86;
+  const gap = (bottom - top) / (ROWS - 1);
+  const amp = Math.min(gap * 7, H * 0.16);
+
+  // Oldest (top) first so each nearer row hides what's behind it.
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    const y0 = bottom - i * gap;
+    ctx.beginPath();
+    for (let j = 0; j < PTS; j++) {
+      const x = left + (right - left) * j / (PTS - 1);
+      const y = y0 - row[j] * ENV[j] * amp;
+      j ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.lineTo(right, y0 + amp);
+    ctx.lineTo(left, y0 + amp);
+    ctx.closePath();
+    ctx.fillStyle = '#000';
+    ctx.fill();
+
+    ctx.beginPath();
+    for (let j = 0; j < PTS; j++) {
+      const x = left + (right - left) * j / (PTS - 1);
+      const y = y0 - row[j] * ENV[j] * amp;
+      j ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    const age = i / (ROWS - 1);
+    ctx.lineWidth = i === 0 ? 1.6 : 1;
+    ctx.strokeStyle = i === 0 ? RED : `rgba(255,255,255,${(1 - age * 0.8).toFixed(3)})`;
+    ctx.stroke();
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+async function start() {
+  if (analyser) return;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('getUserMedia unavailable');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const ac = new AudioContext();
+    analyser = ac.createAnalyser();
+    analyser.fftSize = 4096;
+    buf = new Float32Array(analyser.fftSize);
+    ac.createMediaStreamSource(stream).connect(analyser);
+    hint.textContent = 'listening';
+    setTimeout(() => (hint.style.opacity = 0), 1500);
+  } catch (err) {
+    hint.textContent = 'no mic — synthetic signal';
+  }
+}
+canvas.addEventListener('click', start);
+</script>
+</body>
+</html>
