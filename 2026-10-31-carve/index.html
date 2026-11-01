@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>carve — 2026-10-31</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; touch-action: none; }
+  canvas.turn { cursor: ew-resize; }
+  .label, .hint {
+    position: fixed; left: 16px; padding: 2px 6px; background: #000; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label { top: 14px; }
+  .hint { bottom: 14px; color: #444; pointer-events: none; }
+  .hint b { font-weight: normal; color: #ff2a1f; }
+  #mic { pointer-events: auto; cursor: pointer; }
+  #mic:hover { color: #fff; }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+</style>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-10-31 / carve</div>
+<div class="hint">drag on the pumpkin to carve · drag off it to turn · hold space to blow · <span id="mic">m: use mic</span> · esc: a fresh one</div>
+<canvas></canvas>
+<script>
+// A jack-o'-lantern drawn in glyphs. Each character cell casts a ray at a
+// ribbed ellipsoid shell. Cuts are stored on the shell's surface (longitude x
+// height), so they turn with the pumpkin. Through a cut you see the inside
+// back wall lit by a candle, the candle itself, or straight through if the
+// back is cut too. Blowing (space or mic) gutters the flame and puts it out.
+const canvas = document.querySelector("canvas");
+const ctx = canvas.getContext("2d");
+const micEl = document.getElementById("mic");
+const FONT = (px) => `${px}px ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+const SKIN = " .:-=+*#%@";
+const GLOW = " .:-=+*#";
+const B = 0.8;                       // ellipsoid y radius (x and z are 1)
+const LW = 256, LH = 128;            // carve map: longitude x height
+const BRUSH = 0.055;                 // knife radius on the unit shell
+const FLAME_Y = -0.42, CANDLE_TOP = -0.5, CANDLE_BOT = -0.79;
+const LIGHT = norm([-0.45, 0.55, 0.7]);
+
+// palette: 0..11 greys, 12..21 reds, 22 white
+const PAL = [];
+for (let i = 0; i < 12; i++) { const v = Math.round(34 + (221 * i) / 11); PAL.push(`rgb(${v},${v},${v})`); }
+for (let i = 0; i < 10; i++) PAL.push(`rgba(255,42,31,${(0.12 + (0.88 * i) / 9).toFixed(3)})`);
+PAL.push("#fff");
+const GREY = (t) => Math.max(0, Math.min(11, Math.round(t * 11)));
+const RED = (t) => 12 + Math.max(0, Math.min(9, Math.round(t * 9)));
+const buckets = PAL.map(() => []);
+const put = (c, ch, x, y) => { if (ch !== " ") buckets[c].push(ch, x, y); };
+
+let W, H, cw, chh, cols, rows, R, cx, cy, groundY;
+let carve = new Uint8Array(LW * LH);
+let state, shade;                    // per-cell scratch for the pumpkin's bbox
+let yaw = 0, yawVel = 0, t = 0, last = 0;
+let life = 1, outAt = -1, wind = 0, spaceDown = false;
+let frontFrac = 0, smoke = [];
+let mode = null, prevPt = null, lastTouch = -10;
+let analyser = null, micBuf = null, micLevel = 0;
+
+function norm(v) { const l = Math.hypot(...v); return v.map((x) => x / l); }
+
+// cheap 1D value noise
+const HASH = Array.from({ length: 256 }, () => Math.random());
+function noise1(x) {
+  const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f);
+  return HASH[i & 255] * (1 - u) + HASH[(i + 1) & 255] * u;
+}
+const hash2 = (a, b) => HASH[(a * 31 + b * 17 + (a ^ b)) & 255];
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const fs = Math.max(9, Math.min(15, Math.round(Math.min(W, H) / 58)));
+  ctx.font = FONT(fs);
+  cw = Math.ceil(ctx.measureText("M").width);
+  chh = Math.round(fs * 1.18);
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / chh);
+  R = Math.min(W * 0.34, H * 0.36);
+  cx = W / 2; cy = H * 0.47;
+  groundY = cy + B * R;
+  state = new Uint8Array(cols * rows);
+  shade = new Float32Array(cols * rows);
+}
+
+// ---- geometry -------------------------------------------------------------
+
+// view -> object (rotate about y by -yaw)
+function toObj(x, y, z) {
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return [x * c - z * s, y, x * s + z * c];
+}
+const mapIdx = (lon, v) => {
+  let i = Math.floor(((lon + Math.PI) / (2 * Math.PI)) * LW) % LW;
+  if (i < 0) i += LW;
+  const j = Math.min(LH - 1, Math.max(0, Math.floor(((v + 1) / 2) * LH)));
+  return j * LW + i;
+};
+const isCut = (o) => carve[mapIdx(Math.atan2(o[0], o[2]), o[1] / B)] === 1;
+
+// Screen point -> front surface hit in view coords, or null.
+function hit(px, py) {
+  const x = (px - cx) / R, y = -(py - cy) / R;
+  const q = 1 - x * x - (y * y) / (B * B);
+  return q > 0 ? [x, y, Math.sqrt(q)] : null;
+}
+
+// Cut a disc into the shell around object-space point h.
+function cutAt(h, brush = BRUSH) {
+  const v0 = h[1] / B, rr0 = Math.max(0.08, Math.sqrt(Math.max(0, 1 - v0 * v0)));
+  const lon0 = Math.atan2(h[0], h[2]);
+  const dj = Math.ceil((brush / B / 2) * LH * 1.6) + 1;
+  const di = Math.ceil((brush / rr0 / (2 * Math.PI)) * LW * 1.6) + 1;
+  const i0 = Math.floor(((lon0 + Math.PI) / (2 * Math.PI)) * LW);
+  const j0 = Math.floor(((v0 + 1) / 2) * LH);
+  for (let j = j0 - dj; j <= j0 + dj; j++) {
+    if (j < 0 || j >= LH) continue;
+    const v = ((j + 0.5) / LH) * 2 - 1, rr = Math.sqrt(Math.max(0, 1 - v * v));
+    for (let ii = i0 - di; ii <= i0 + di; ii++) {
+      const i = ((ii % LW) + LW) % LW;
+      const lon = ((i + 0.5) / LW) * 2 * Math.PI - Math.PI;
+      const d = Math.hypot(rr * Math.sin(lon) - h[0], v * B - h[1], rr * Math.cos(lon) - h[2]);
+      if (d < brush) carve[j * LW + i] = 1;
+    }
+  }
+}
+
+// Cut along a line given in surface coords (lon, v), used for the starting eyes.
+function cutLine(lon0, v0, lon1, v1) {
+  for (let k = 0; k <= 32; k++) {
+    const lon = lon0 + ((lon1 - lon0) * k) / 32, v = v0 + ((v1 - v0) * k) / 32;
+    const rr = Math.sqrt(1 - v * v);
+    cutAt([rr * Math.sin(lon), v * B, rr * Math.cos(lon)], 0.035);
+  }
+}
+function xEyes() {
+  for (const s of [-1, 1]) {
+    const lon = s * 0.38, v = 0.27, a = 0.21, b = 0.2;
+    cutLine(lon - a, v + b, lon + a, v - b);
+    cutLine(lon - a, v - b, lon + a, v + b);
+  }
+}
+
+// ---- candle ---------------------------------------------------------------
+
+function flame() {
+  const lean = wind * 0.9 * (0.6 + 0.4 * noise1(t * 9)) + (noise1(t * 3.1 + 7) - 0.5) * 0.25;
+  const h = 0.22 * life * (0.85 + 0.3 * noise1(t * 6.3));
+  return { lean, h, w: 0.06 * Math.max(0.4, life) };
+}
+
+// What a ray through view (x, y) sees inside the shell: flame, candle or null.
+function candleAt(x, y, f) {
+  if (life > 0.02 && f.h > 0.01) {
+    const dy = (y - FLAME_Y) / f.h;
+    if (dy > -0.25 && dy < 1) {
+      const dx = (x - f.lean * Math.max(0, dy) * f.h * 0.8) / f.w;
+      const prof = Math.sin(Math.PI * (dy + 0.25) / 1.25) ** 0.7 * (1 - Math.max(0, dy) * 0.55);
+      if (Math.abs(dx) < prof) return Math.abs(dx) < prof * 0.45 && dy < 0.55 ? "core" : "flame";
+    }
+  }
+  if (Math.abs(x) < 0.07 && y < CANDLE_TOP && y > CANDLE_BOT) return "candle";
+  if (Math.abs(x) < 0.008 && y >= CANDLE_TOP && y < FLAME_Y) return "wick";
+  return null;
+}
+
+// ---- frame ----------------------------------------------------------------
+
+function frame(ms) {
+  const dt = Math.min(0.05, (ms - last) / 1000 || 0);
+  last = ms; t += dt;
+  updateWind(dt);
+  updateYaw(dt);
+  for (const b of buckets) b.length = 0;
+
+  const f = flame();
+  const light = life * (0.8 + 0.2 * noise1(t * 11)) * (1 - 0.35 * wind * noise1(t * 17 + 3));
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  drawGround(light);
+  drawPumpkin(f, light);
+  drawStem();
+  drawSmoke(dt);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  buckets.forEach((b, c) => {
+    if (!b.length) return;
+    ctx.fillStyle = PAL[c];
+    for (let k = 0; k < b.length; k += 3) ctx.fillText(b[k], b[k + 1], b[k + 2]);
+  });
+  requestAnimationFrame(frame);
+}
+
+function drawPumpkin(f, light) {
+  const c0 = Math.max(0, Math.floor((cx - R) / cw) - 1), c1 = Math.min(cols - 1, Math.ceil((cx + R) / cw) + 1);
+  const r0 = Math.max(0, Math.floor((cy - B * R) / chh) - 1), r1 = Math.min(rows - 1, Math.ceil((cy + B * R) / chh) + 1);
+  const cyaw = Math.cos(yaw), syaw = Math.sin(yaw);
+
+  // pass 1: classify every cell (0 empty, 1 skin, 2 cut)
+  let vis = 0, cut = 0;
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const k = r * cols + c, px = c * cw + cw / 2, py = r * chh + chh / 2;
+      const p = hit(px, py);
+      state[k] = 0;
+      if (!p) continue;
+      const [x, y, z] = p;
+      const ox = x * cyaw - z * syaw, oz = x * syaw + z * cyaw;
+      const lon = Math.atan2(ox, oz);
+      vis++;
+      if (carve[mapIdx(lon, y / B)]) { state[k] = 2; cut++; continue; }
+      state[k] = 1;
+      const n = norm([x, y / (B * B), z]);
+      const diff = Math.max(0, n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2]);
+      const rib = 0.3 + 0.7 * Math.abs(Math.cos(lon * 5)) ** 0.35;
+      shade[k] = (0.12 + 0.88 * diff) * rib * (0.45 + 0.55 * z);
+    }
+  }
+  frontFrac = vis ? cut / vis : 0;
+
+  // pass 2: emit glyphs
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const k = r * cols + c, s = state[k];
+      if (!s) continue;
+      const px = c * cw + cw / 2, py = r * chh + chh / 2;
+      if (s === 1) {
+        const b = shade[k];
+        const edge = (c > c0 && state[k - 1] === 2) || (c < c1 && state[k + 1] === 2) ||
+                     (r > r0 && state[k - cols] === 2) || (r < r1 && state[k + cols] === 2);
+        const ch = SKIN[Math.min(9, Math.max(1, Math.round(b * 9)))];
+        if (edge && light > 0.15) put(RED(0.55 + 0.45 * light), "%", px, py);
+        else put(GREY(b), ch, px, py);
+        continue;
+      }
+      // cut: look inside
+      const x = (px - cx) / R, y = -(py - cy) / R;
+      const z = Math.sqrt(Math.max(0, 1 - x * x - (y * y) / (B * B)));
+      const what = candleAt(x, y, f);
+      if (what === "core") { put(22, "@", px, py); continue; }
+      if (what === "flame") { put(RED(0.75 + 0.25 * light), noise1(t * 20 + c * 3.7 + r) > 0.5 ? "^" : "*", px, py); continue; }
+      if (what === "candle") { put(GREY(0.25 + 0.6 * light * (1 - Math.abs(x) * 6)), "|", px, py); continue; }
+      if (what === "wick") { put(GREY(0.2), "'", px, py); continue; }
+      const back = toObj(x, y, -z);
+      if (isCut(back)) {           // straight through: show what's behind
+        if (py > groundY) put(GREY(0.08), ".", px, py);
+        continue;
+      }
+      const d2 = back[0] ** 2 + (back[1] - FLAME_Y) ** 2 + back[2] ** 2;
+      const I = Math.min(1, (0.32 / (d2 + 0.12)) * light) + (hash2(c, r) - 0.5) * 0.12 * light;
+      if (light < 0.05) { put(GREY(0.04), ".", px, py); continue; }
+      put(RED(I), GLOW[Math.max(1, Math.min(7, Math.round(I * 7)))], px, py);
+    }
+  }
+}
+
+function drawGround(light) {
+  const r0 = Math.floor(groundY / chh) + 1;
+  // the light that escapes through the holes facing you, thrown on the ground
+  const spill = Math.min(1, frontFrac * 6) * light * 0.8;
+  const sx = cx + Math.sin(yaw) * R * 0.45, sy = groundY + R * 0.1;
+  for (let r = r0; r < rows; r++) {
+    const py = r * chh + chh / 2, depth = (py - groundY) / (H - groundY + 1);
+    for (let c = 0; c < cols; c++) {
+      const px = c * cw + cw / 2;
+      const dx = (px - sx) / (R * 1.1), dy = (py - sy) / (R * 0.26);
+      const g = spill * Math.exp(-(dx * dx + dy * dy)) + (hash2(c, r) - 0.5) * 0.14 * spill;
+      if (g > 0.08) { put(RED(g * 0.9), GLOW[Math.max(1, Math.min(5, Math.round(g * 6)))], px, py); continue; }
+      // no stars right under it: that's its shadow
+      if (Math.abs(px - cx) < R * 0.8 * Math.sqrt(Math.max(0, 1 - ((py - groundY) / (R * 0.16)) ** 2))) continue;
+      if ((c + r * 3) % (5 + Math.floor((1 - depth) * 4)) === 0) put(GREY(0.03 + depth * 0.06), ".", px, py);
+    }
+  }
+}
+
+function drawStem() {
+  const top = cy - B * R, len = R * 0.2, wdt = R * 0.075;
+  const tipX = (0.09 * Math.cos(yaw) + 0.03 * Math.sin(yaw)) * R;
+  for (let r = Math.floor((top - len) / chh); r <= Math.ceil(top / chh); r++) {
+    const py = r * chh + chh / 2;
+    if (py > top + chh * 0.3 || py < top - len) continue;
+    const u = (top - py) / len;                       // 0 at base, 1 at tip
+    const mid = cx + tipX * u * u;
+    const half = wdt * (1 - 0.35 * u);
+    for (let c = Math.floor((mid - half) / cw); c <= Math.ceil((mid + half) / cw); c++) {
+      const px = c * cw + cw / 2;
+      if (r < 0 || c < 0 || c >= cols || Math.abs(px - mid) > half) continue;
+      if (hit(px, py) && state[r * cols + c]) continue;   // pumpkin in front
+      const side = (px - mid) / half;                     // -1 lit side .. 1 dark side
+      put(GREY(0.55 - side * 0.35), u > 0.85 ? "=" : "#", px, py);
+    }
+  }
+}
+
+// ---- blowing --------------------------------------------------------------
+
+function updateWind(dt) {
+  if (analyser) {
+    analyser.getFloatTimeDomainData(micBuf);
+    let s = 0;
+    for (let i = 0; i < micBuf.length; i++) s += micBuf[i] * micBuf[i];
+    const rms = Math.sqrt(s / micBuf.length);
+    micLevel += (rms - micLevel) * (rms > micLevel ? 0.5 : 0.08);
+  }
+  const target = Math.max(spaceDown ? 1 : 0, Math.min(1, Math.max(0, (micLevel - 0.015) / 0.11)));
+  wind += (target - wind) * Math.min(1, dt * 10);
+
+  if (outAt >= 0) {
+    if (t - outAt > 3.2) { life = Math.min(1, life + dt * 1.6); if (life >= 1) outAt = -1; }
+    return;
+  }
+  if (wind > 0.3) life -= (wind - 0.2) * dt * 2.4;
+  else life = Math.min(1, life + dt * 0.7);
+  if (life <= 0) { life = 0; outAt = t; puff(); }
+}
+
+// smoke leaves through the top and through whatever is cut facing you
+function puff() {
+  const exits = [];
+  for (let k = 0; k < state.length; k++) if (state[k] === 2) exits.push(k);
+  for (let n = 0; n < 46; n++) {
+    let x = cx + (Math.random() - 0.5) * R * 0.1, y = cy - B * R;
+    if (exits.length && Math.random() < 0.75) {
+      const k = exits[Math.floor(Math.random() * exits.length)];
+      x = (k % cols) * cw + cw / 2; y = Math.floor(k / cols) * chh;
+    }
+    smoke.push({ x, y, vx: (Math.random() - 0.5) * 12, vy: -18 - Math.random() * 30, age: -Math.random() * 0.8, life: 2 + Math.random() * 1.8, ph: Math.random() * 9 });
+  }
+}
+
+function drawSmoke(dt) {
+  smoke = smoke.filter((p) => p.age < p.life);
+  for (const p of smoke) {
+    p.age += dt;
+    if (p.age < 0) continue;
+    p.x += (p.vx + Math.sin(p.age * 2.3 + p.ph) * 14) * dt;
+    p.y += p.vy * dt;
+    const a = 1 - p.age / p.life;
+    const c = Math.round(p.x / cw - 0.5), r = Math.round(p.y / chh - 0.5);
+    put(GREY(0.12 + 0.4 * a), "~()'."[Math.floor(p.ph + p.age * 3) % 5], c * cw + cw / 2, r * chh + chh / 2);
+  }
+}
+
+async function toggleMic() {
+  if (analyser) {
+    analyser.ctx.close(); analyser.stream.getTracks().forEach((tr) => tr.stop());
+    analyser = null; micLevel = 0; micEl.textContent = "m: use mic"; return;
+  }
+  try {
+    micEl.textContent = "m: asking…";
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const actx = new AudioContext();
+    const a = actx.createAnalyser();
+    a.fftSize = 1024;
+    actx.createMediaStreamSource(stream).connect(a);
+    a.ctx = actx; a.stream = stream;
+    micBuf = new Float32Array(a.fftSize);
+    analyser = a;
+    micEl.innerHTML = "<b>mic on</b> — blow on it (m: off)";
+  } catch (err) {
+    micEl.textContent = "no mic — space still blows";
+  }
+}
+
+// ---- input ----------------------------------------------------------------
+
+function updateYaw(dt) {
+  if (mode === "carve") { yawVel = 0; return; }
+  if (mode !== "turn") {
+    const idle = t - lastTouch > 4;
+    const target = idle ? 0.22 * Math.sin(t * 0.35) : yaw * 0.995;
+    yawVel += (target - yaw) * 2.2 * dt;
+    yawVel *= Math.exp(-dt * 1.6);
+  }
+  yaw += yawVel * dt;
+}
+
+function carveStroke(x0, y0, x1, y1) {
+  const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / (R * BRUSH * 0.6)));
+  for (let i = 1; i <= n; i++) {
+    const p = hit(x0 + ((x1 - x0) * i) / n, y0 + ((y1 - y0) * i) / n);
+    if (p) cutAt(toObj(...p));
+  }
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  lastTouch = t;
+  prevPt = { x: e.clientX, y: e.clientY, at: performance.now() };
+  if (hit(e.clientX, e.clientY)) {
+    mode = "carve";
+    const p = hit(e.clientX, e.clientY);
+    cutAt(toObj(...p));
+  } else {
+    mode = "turn";
+    canvas.classList.add("turn");
+  }
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!mode) { canvas.classList.toggle("turn", !hit(e.clientX, e.clientY)); return; }
+  lastTouch = t;
+  const now = performance.now();
+  if (mode === "carve") carveStroke(prevPt.x, prevPt.y, e.clientX, e.clientY);
+  else {
+    const d = (e.clientX - prevPt.x) / R;
+    yaw += d;
+    yawVel = (d / Math.max(0.008, (now - prevPt.at) / 1000)) * 0.6;
+  }
+  prevPt = { x: e.clientX, y: e.clientY, at: now };
+});
+const release = () => { mode = null; canvas.classList.remove("turn"); };
+addEventListener("pointerup", release);
+addEventListener("pointercancel", release);
+
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === " ") { spaceDown = true; e.preventDefault(); }
+  else if (e.key === "m" || e.key === "M") toggleMic();
+  else if (e.key === "Escape") { carve.fill(0); life = 1; outAt = -1; }
+});
+micEl.addEventListener("click", toggleMic);
+addEventListener("keyup", (e) => { if (e.key === " ") spaceDown = false; });
+addEventListener("blur", () => { spaceDown = false; });
+
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(resize, 150); });
+resize();
+xEyes();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
