@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sine script — 2026-11-02</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  .label, .line, .hint {
+    padding: 2px 6px; background: #000; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label { position: fixed; left: 16px; top: 14px; }
+  .foot { position: fixed; left: 16px; right: 16px; bottom: 14px; display: flex; flex-direction: column;
+    align-items: flex-start; gap: 3px; pointer-events: none; }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+  .line { color: #bbb; text-transform: none; white-space: pre; }
+  .line b { font-weight: normal; color: #ff2a1f; }
+  .line i { font-style: normal; color: #555; }
+  .line .caret { display: inline-block; width: 1ch; background: #666; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { background: transparent; } }
+  .hint { color: #444; }
+  .hint b { font-weight: normal; color: #ff2a1f; }
+  input { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0;
+    font-size: 16px; caret-color: transparent; }
+</style>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-11-02 / sine script</div>
+<div class="foot">
+  <div class="line" id="line"></div>
+  <div class="hint"><span id="sound"><b>tap or type to hear</b> · </span><span id="how"></span></div>
+</div>
+<input id="type" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="enter" aria-label="type to play">
+<canvas></canvas>
+<script>
+// Writing with a sine bank. Each typed letter is rasterised into a strip of
+// columns, 20 cells tall; each cell row is one sine tone (a pentatonic scale
+// from E4 up four octaves) and each column lasts 50 ms. So a letter is a
+// chord that changes shape as it goes by, and a spectrogram of the sound shows
+// the letter again. Right of the red line is the score, still to be played,
+// drawn as x marks. Left of it is a live FFT of the actual audio output,
+// so what you see there is what the analyser heard, not a copy of the score.
+// Draw right of the line to add your own tones. The last line you typed
+// repeats while you're not typing.
+const canvas = document.querySelector("canvas");
+const ctx = canvas.getContext("2d");
+const input = document.getElementById("type");
+const lineEl = document.getElementById("line");
+const soundEl = document.getElementById("sound");
+const howEl = document.getElementById("how");
+const RED = "#ff2a1f";
+const RAMP = " .:-=+*#%@";
+const LEVELS = RAMP.length - 1;
+const R = 20;                       // tones, i.e. cell rows a letter is tall
+const SCALE = [0, 2, 4, 7, 9];      // major pentatonic
+const BASE_HZ = 329.63;             // E4
+const DT = 0.05;                    // s per column
+const LOOKAHEAD = 0.12;             // s of audio scheduled ahead
+const SQUEEZE = 0.62;               // letters are condensed so a word isn't too slow
+const GAP = 14;                     // blank columns before the line repeats
+const MAX_QUEUE = 2400;             // 2 minutes of columns
+const HISTORY = 600;
+const coarse = matchMedia("(pointer: coarse)").matches;
+
+// pitch of scale step s (0 = E4); steps outside 0..R-1 are only drawn, not played
+const hz = (s) => {
+  const o = Math.floor(s / SCALE.length), d = ((s % SCALE.length) + SCALE.length) % SCALE.length;
+  return BASE_HZ * 2 ** (o + SCALE[d] / 12);
+};
+
+let W, H, fs, CW, CH, cols, rows, bandTop, head, glyphs = new Map();
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // big enough that the letters fill about half the height, small enough for ~48 columns
+  fs = Math.floor(Math.max(10, Math.min(22, H * 0.55 / R / 1.25, W / 48 / 0.6)));
+  ctx.font = `${fs}px ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "center";
+  CW = Math.ceil(ctx.measureText("M").width);
+  CH = Math.round(fs * 1.25);
+  cols = Math.ceil(W / CW) + 1;
+  rows = Math.ceil(H / CH);
+  bandTop = Math.max(2, Math.floor((rows - R) / 2) - 1);
+  head = Math.round(cols * (W < 600 ? 0.55 : 0.62));
+  glyphs.clear();
+  howEl.textContent = coarse
+    ? "tap left of the red line to type · draw right of it"
+    : "type · enter for a new line · draw right of the red line";
+}
+addEventListener("resize", resize);
+resize();
+
+// ---- letters -> columns -----------------------------------------------------
+
+const off = document.createElement("canvas");
+const octx = off.getContext("2d", { willReadFrequently: true });
+
+// One letter as an array of columns, each a Float32Array(R) of loudness 0..1,
+// index 0 = lowest tone (bottom row). Sampled on the same cell grid the screen
+// uses, so the letter shows up the right shape in the spectrogram.
+function glyph(ch) {
+  if (glyphs.has(ch)) return glyphs.get(ch);
+  const h = R * CH, px = Math.round(h / 1.08);
+  const font = `bold ${px}px "Helvetica Neue", Arial, "DejaVu Sans", sans-serif`;
+  octx.font = font;
+  const w = Math.max(CW, Math.ceil(octx.measureText(ch).width * SQUEEZE));
+  const n = Math.max(1, Math.round(w / CW));
+  off.width = n * CW; off.height = h;
+  octx.font = font;
+  octx.fillStyle = "#fff";
+  octx.textBaseline = "alphabetic";
+  octx.setTransform(SQUEEZE, 0, 0, 1, 0, 0);
+  octx.fillText(ch, (n * CW / SQUEEZE - octx.measureText(ch).width) / 2, Math.round(px * 0.84));
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  const img = octx.getImageData(0, 0, n * CW, h).data;
+  const out = [];
+  for (let c = 0; c < n; c++) {
+    const col = new Float32Array(R);
+    for (let r = 0; r < R; r++) {
+      let sum = 0;
+      for (let y = r * CH; y < (r + 1) * CH; y++)
+        for (let x = c * CW; x < (c + 1) * CW; x++) sum += img[(y * n * CW + x) * 4 + 3];
+      col[R - 1 - r] = Math.min(1, (sum / (CW * CH * 255)) * 1.25);
+    }
+    out.push(col);
+  }
+  out.push(new Float32Array(R));        // a blank column between letters
+  glyphs.set(ch, out);
+  return out;
+}
+
+// ---- the tape ---------------------------------------------------------------
+// pending: columns not yet scheduled, { a, line, i, rep }
+// inflight: columns scheduled to sound, { a, t, step, line, i }
+// paint: drawn tones keyed by the absolute step they'll play at
+let pending = [], inflight = [], paint = new Map();
+let stepNo = 0;                     // absolute step of pending[0]
+let nextT = 0;                      // when pending[0] starts
+let current = null;                 // column sounding right now
+let history = [];                   // heard columns, newest last: { m: Float32Array(rows of steps), silent }
+let lines = [{ text: "write in sound", id: 0 }], lineId = 0;
+let typing = lines[0];              // the line being typed / repeated
+let fresh = true;                   // nothing typed yet: the first key starts a new line
+let lastKey = -Infinity;            // wall-clock time of the last edit
+
+function enqueueText(line, from, rep) {
+  for (let i = from; i < line.text.length; i++) {
+    if (pending.length >= MAX_QUEUE) break;
+    for (const a of glyph(line.text[i])) pending.push({ a, line: line.id, i, rep });
+  }
+}
+
+function dropRepeats() {
+  // whatever is left of an automatic repeat gives way to new typing
+  const k = pending.findIndex((c) => c.rep);
+  if (k >= 0) pending.length = k;
+}
+
+function typeChar(ch) {
+  if (fresh) { fresh = false; typing = { text: "", id: ++lineId }; }
+  dropRepeats();
+  typing.text += ch;
+  enqueueText(typing, typing.text.length - 1, false);
+  lastKey = wall();
+}
+
+function backspace() {
+  if (fresh || !typing.text.length) return;
+  dropRepeats();
+  const i = typing.text.length - 1;
+  while (pending.length && pending[pending.length - 1].line === typing.id && pending[pending.length - 1].i === i) pending.pop();
+  typing.text = typing.text.slice(0, -1);
+  lastKey = wall();
+}
+
+function newLine() {
+  if (!typing.text.length) return;
+  fresh = true;                       // keep repeating it until something new is typed
+  input.value = "";
+  lastKey = wall();
+}
+
+// ---- sound ------------------------------------------------------------------
+
+let audio = null;
+
+function startAudio() {
+  if (audio) { if (audio.ctx.state !== "running") audio.ctx.resume(); return; }
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const master = ac.createGain();
+  master.gain.value = 0.9;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 8; comp.attack.value = 0.003;
+  const analyser = ac.createAnalyser();
+  analyser.fftSize = 4096;
+  analyser.smoothingTimeConstant = 0;
+  analyser.minDecibels = -84; analyser.maxDecibels = -20;
+  master.connect(comp);
+  comp.connect(analyser);
+  comp.connect(ac.destination);
+  const gains = [];
+  for (let b = 0; b < R; b++) {
+    const o = ac.createOscillator();
+    o.type = "sine";
+    o.frequency.value = hz(b);
+    const g = ac.createGain();
+    g.gain.value = 0;
+    o.connect(g).connect(master);
+    o.start();
+    gains.push(g.gain);
+  }
+  audio = { ctx: ac, gains, analyser, bins: new Float32Array(analyser.frequencyBinCount), ready: false };
+  ac.resume().then(() => {
+    // carry on from the silent clock onto the audio clock
+    const d = ac.currentTime - wall();
+    for (const c of inflight) c.t += d;
+    nextT += d;
+    audio.ready = true;
+    soundEl.style.display = "none";
+  });
+}
+
+const wall = () => performance.now() / 1000;
+const clock = () => (audio && audio.ready ? audio.ctx.currentTime : wall());
+
+// higher tones are a little quieter, so the chord doesn't get shrill
+const tilt = Array.from({ length: R }, (_, b) => (BASE_HZ / hz(b)) ** 0.35);
+const VOICE = 0.11;
+
+function schedule() {
+  const now = clock();
+  if (nextT < now) nextT = now + 0.02;    // fell behind (hidden tab): skip ahead, don't burst
+  while (nextT < now + LOOKAHEAD) {
+    if (!pending.length) {
+      if (wall() - lastKey < 0.8 || !typing.text.length) {
+        // just typed (or nothing to repeat): keep the tape moving with silence
+        pending.push({ a: new Float32Array(R), line: -1, i: -1, rep: false });
+      } else {
+        // idle: the current line again after a short gap
+        for (let g = 0; g < GAP; g++) pending.push({ a: new Float32Array(R), line: -1, i: -1, rep: true });
+        enqueueText(typing, 0, true);
+      }
+    }
+    const c = pending.shift();
+    const a = new Float32Array(c.a);
+    const p = paint.get(stepNo);
+    if (p) for (let b = 0; b < R; b++) a[b] = Math.max(a[b], p[b]);
+    paint.delete(stepNo);
+    if (audio && audio.ready) {
+      for (let b = 0; b < R; b++) {
+        const g = audio.gains[b];
+        g.setTargetAtTime(a[b] * a[b] * VOICE * tilt[b], nextT, 0.006);
+        g.setTargetAtTime(0, nextT + DT, 0.006);   // silence if nothing follows
+      }
+    }
+    inflight.push({ a, t: nextT, step: stepNo, line: c.line, i: c.i });
+    stepNo++;
+    nextT += DT;
+  }
+}
+
+// FFT magnitude 0..1 for each screen row, which is scale step bandTop-relative.
+// Rows above and below the 20 tones keep going up/down the same scale.
+function listen() {
+  const m = new Float32Array(rows);
+  const an = audio.analyser, bins = audio.bins;
+  an.getFloatFrequencyData(bins);
+  const binHz = audio.ctx.sampleRate / an.fftSize, span = an.maxDecibels - an.minDecibels;
+  for (let row = 0; row < rows; row++) {
+    const s = bandTop + R - 1 - row, f = hz(s);
+    const lo = Math.round(Math.sqrt(f * hz(s - 1)) / binHz), hi = Math.round(Math.sqrt(f * hz(s + 1)) / binHz);
+    let best = -Infinity;
+    for (let k = Math.max(1, lo); k <= Math.min(bins.length - 1, Math.max(lo, hi - 1)); k++) best = Math.max(best, bins[k]);
+    const comp = s >= 0 && s < R ? 1 / tilt[s] ** 0.5 : 1;
+    m[row] = Math.max(0, Math.min(1, ((best - an.minDecibels) / span) * comp));
+  }
+  return m;
+}
+
+// ---- drawing ----------------------------------------------------------------
+
+const GREYS = Array.from({ length: LEVELS + 1 }, (_, i) => {
+  const v = Math.round(40 + 215 * (i / LEVELS) ** 1.2);
+  return `rgb(${v},${v},${v})`;
+});
+let buckets = GREYS.map(() => []);
+
+function put(level, ch, x, y) { buckets[level].push(ch, x, y); }
+
+function flush(styles) {
+  for (let l = 0; l < buckets.length; l++) {
+    const b = buckets[l];
+    if (!b.length) continue;
+    ctx.fillStyle = styles[l];
+    for (let j = 0; j < b.length; j += 3) ctx.fillText(b[j], b[j + 1], b[j + 2]);
+    b.length = 0;
+  }
+}
+
+function futureAt(k) {
+  // column k steps to the right of the playhead: [text loudness, painted loudness]
+  const s = (current ? current.step : stepNo) + k;
+  const inf = inflight.find((c) => c.step === s);
+  if (inf) return [inf.a, null];
+  const c = pending[s - stepNo];
+  return [c ? c.a : null, paint.get(s) || null];
+}
+
+function frame() {
+  schedule();
+  const now = clock();
+
+  // retire columns that have finished; their sound is in the analyser now
+  while (inflight.length && inflight[0].t + DT <= now) {
+    const c = inflight.shift();
+    if (audio && audio.ready) history.push({ m: listen(), silent: false });
+    else {
+      const m = new Float32Array(rows);
+      for (let b = 0; b < R; b++) m[bandTop + R - 1 - b] = c.a[b];
+      history.push({ m, silent: true });
+    }
+  }
+  if (history.length > HISTORY) history.splice(0, history.length - HISTORY);
+  current = inflight.find((c) => c.t <= now) || null;
+  const frac = current ? Math.min(1, (now - current.t) / DT) : 0;
+  const shift = -frac * CW;
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  const hx = (head + 0.5) * CW;
+
+  // heard: newest history column sits just left of the playhead
+  for (let k = 1; k <= head + 1 && k <= history.length; k++) {
+    const h = history[history.length - k], x = hx - k * CW + shift;
+    for (let row = 0; row < rows; row++) {
+      const v = h.m[row];
+      if (h.silent) { if (v > 0.3) put(1, "·", x, (row + 0.5) * CH); continue; }
+      const l = Math.round(v * LEVELS);
+      if (l > 0) put(l, RAMP[l], x, (row + 0.5) * CH);
+    }
+  }
+
+  // score: x for letters, X for drawn tones
+  for (let k = 1; k <= cols - head; k++) {
+    const [a, p] = futureAt(k), x = hx + k * CW + shift;
+    if (!a && !p) continue;
+    for (let b = 0; b < R; b++) {
+      const y = (bandTop + R - 1 - b + 0.5) * CH;
+      if (p && p[b] > 0) put(9, "X", x, y);
+      else if (a && a[b] > 0.5) put(a[b] > 0.8 ? 3 : 2, "x", x, y);
+      else if (a && a[b] > 0.2) put(1, "·", x, y);
+    }
+  }
+  flush(GREYS);
+
+  // the playhead: what's sounding now, in red
+  ctx.fillStyle = "#3a0b08";
+  ctx.fillRect(hx - CW / 2, bandTop * CH, CW, R * CH);
+  ctx.fillStyle = RED;
+  for (let b = 0; b < R; b++) {
+    const v = current ? current.a[b] : 0;
+    const l = Math.round(v * LEVELS);
+    ctx.fillText(l > 0 ? RAMP[l] : "|", hx, (bandTop + R - 1 - b + 0.5) * CH);
+  }
+
+  drawLine();
+  requestAnimationFrame(frame);
+}
+
+// the line under the score: what's been typed, the letter sounding now in red
+let shown = "";
+function drawLine() {
+  const t = typing.text;
+  const playing = current && current.line === typing.id ? current.i : -1;
+  const fit = Math.max(8, Math.floor((W - 60) / 7.2) - (fresh ? 20 : 4));   // chars that fit at 11px
+  const key = t + "|" + playing + "|" + fresh + "|" + fit;
+  if (key === shown) return;
+  shown = key;
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const from = Math.max(0, t.length - fit);    // long lines: show the end
+  let html = from ? "› …" : "› ";
+  for (let i = from; i < t.length; i++) html += i === playing ? `<b>${esc(t[i])}</b>` : esc(t[i]);
+  html += fresh ? (coarse ? "" : " <i>(type to replace)</i>") : '<span class="caret">&nbsp;</span>';
+  lineEl.innerHTML = html;
+}
+
+// ---- input ------------------------------------------------------------------
+
+// Typing goes through a hidden input so phone keyboards work too. The input's
+// value mirrors the line; diffing it handles autocorrect and composition.
+input.addEventListener("input", () => {
+  startAudio();
+  const v = input.value, t = fresh ? "" : typing.text;
+  let p = 0;
+  while (p < v.length && p < t.length && v[p] === t[p]) p++;
+  for (let i = t.length; i > p; i--) backspace();
+  for (const ch of v.slice(p)) if (ch !== "\n") typeChar(ch);
+});
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); startAudio(); newLine(); }
+});
+addEventListener("keydown", (e) => {
+  // a key pressed while the input isn't focused: focus it and let the key land there
+  if (document.activeElement !== input && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    input.focus({ preventScroll: true });
+    if (e.key === "Enter") { e.preventDefault(); startAudio(); newLine(); }
+  }
+});
+
+let drawing = null;
+function cellAt(e) {
+  const r = canvas.getBoundingClientRect();
+  const now = clock(), frac = current ? Math.min(1, (now - current.t) / DT) : 0;
+  const x = e.clientX - r.left + frac * CW;
+  return [Math.floor(x / CW) - head, bandTop + R - 1 - Math.floor((e.clientY - r.top) / CH)];
+}
+function dot(k, b) {
+  if (k < 1 || b < 0 || b >= R) return;
+  const s = (current ? current.step : stepNo) + k;
+  if (s < stepNo) return;               // already scheduled
+  if (!paint.has(s)) paint.set(s, new Float32Array(R));
+  paint.get(s)[b] = 1;
+}
+function stroke(k0, b0, k1, b1) {
+  const n = Math.max(Math.abs(k1 - k0), Math.abs(b1 - b0), 1);
+  for (let i = 0; i <= n; i++) dot(Math.round(k0 + (k1 - k0) * i / n), Math.round(b0 + (b1 - b0) * i / n));
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  startAudio();
+  const [k, b] = cellAt(e);
+  if (k >= 1) {
+    canvas.setPointerCapture(e.pointerId);
+    // stick to absolute steps so a held stroke stays put while the tape moves
+    const s = (current ? current.step : stepNo);
+    drawing = { id: e.pointerId, step: s + k, b };
+    dot(k, b);
+  } else if (e.pointerType !== "mouse") {
+    e.preventDefault();                  // keep the follow-up mouse events from taking focus back
+    input.focus();                       // phones: tap the heard side to bring up the keyboard
+  }
+});
+canvas.addEventListener("pointermove", (e) => {
+  canvas.style.cursor = cellAt(e)[0] >= 1 ? "crosshair" : "text";
+  if (!drawing || e.pointerId !== drawing.id) return;
+  const [k, b] = cellAt(e);
+  const base = current ? current.step : stepNo;
+  stroke(drawing.step - base, drawing.b, k, b);
+  drawing.step = base + k; drawing.b = b;
+});
+const release = (e) => {
+  if (drawing && e.pointerId === drawing.id) drawing = null;
+  if (e.pointerType === "mouse") input.focus({ preventScroll: true });
+};
+canvas.addEventListener("pointerup", release);
+canvas.addEventListener("pointercancel", release);
+
+if (!coarse) input.focus({ preventScroll: true });
+nextT = clock();
+enqueueText(typing, 0, true);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

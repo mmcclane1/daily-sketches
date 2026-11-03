@@ -1,0 +1,1 @@
+Type and your words play as a chord of sine tones whose live spectrogram spells them back in ASCII — right of the red line is the score in x marks, left is what the analyser actually hears; draw right of the line to add notes.
