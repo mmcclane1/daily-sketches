@@ -95,8 +95,8 @@ function resize() {
   head = Math.round(cols * (W < 600 ? 0.55 : 0.62));
   glyphs.clear();
   howEl.textContent = coarse
-    ? "tap left of the red line to type · draw right of it"
-    : "type · enter for a new line · draw right of the red line";
+    ? "tap to type · draw right of the line"
+    : "type · draw right of the line";
 }
 addEventListener("resize", resize);
 resize();
@@ -391,7 +391,7 @@ function drawLine() {
   const from = Math.max(0, t.length - fit);    // long lines: show the end
   let html = from ? "› …" : "› ";
   for (let i = from; i < t.length; i++) html += i === playing ? `<b>${esc(t[i])}</b>` : esc(t[i]);
-  html += fresh ? (coarse ? "" : " <i>(type to replace)</i>") : '<span class="caret">&nbsp;</span>';
+  html += fresh ? "" : '<span class="caret">&nbsp;</span>';
   lineEl.innerHTML = html;
 }
 

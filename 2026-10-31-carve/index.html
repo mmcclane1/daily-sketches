@@ -26,7 +26,7 @@
 </head>
 <body>
 <div class="label"><a href="../index.html">←</a> 2026-10-31 / carve</div>
-<div class="hint">drag on the pumpkin to carve · drag off it to turn · hold space to blow · <span id="mic">m: use mic</span> · esc: a fresh one</div>
+<div class="hint">drag to carve · drag off it to turn · hold space to blow · <span id="mic">m: mic</span></div>
 <canvas></canvas>
 <script>
 // A jack-o'-lantern drawn in glyphs. Each character cell casts a ray at a
@@ -356,7 +356,7 @@ function drawSmoke(dt) {
 async function toggleMic() {
   if (analyser) {
     analyser.ctx.close(); analyser.stream.getTracks().forEach((tr) => tr.stop());
-    analyser = null; micLevel = 0; micEl.textContent = "m: use mic"; return;
+    analyser = null; micLevel = 0; micEl.textContent = "m: mic"; return;
   }
   try {
     micEl.textContent = "m: asking…";
@@ -368,9 +368,9 @@ async function toggleMic() {
     a.ctx = actx; a.stream = stream;
     micBuf = new Float32Array(a.fftSize);
     analyser = a;
-    micEl.innerHTML = "<b>mic on</b> — blow on it (m: off)";
+    micEl.innerHTML = "<b>mic on</b> (m: off)";
   } catch (err) {
-    micEl.textContent = "no mic — space still blows";
+    micEl.textContent = "no mic";
   }
 }
 
