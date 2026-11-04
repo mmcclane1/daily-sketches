@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ink sort — 2026-11-03</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: crosshair; touch-action: none; }
+  .label, .hint {
+    position: fixed; left: 16px; padding: 2px 6px; background: #000; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label { top: 14px; }
+  .hint { bottom: 14px; color: #444; pointer-events: none; }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+</style>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-11-03 / ink sort</div>
+<div class="hint">drag to sort · esc to restore</div>
+<canvas></canvas>
+<script>
+// The page's own source as a wall of text. Each glyph's ink is measured once
+// (how much of its cell it covers in this font), and dragging runs an odd-even
+// transposition sort under the brush, along the direction of the drag: heavy
+// glyphs get carried ahead of the brush and light ones fall out behind it.
+// Hold still and the heavy ones sink. Swaps flash red; esc (or a double tap)
+// sends every glyph back to where it started.
+const SOURCE = document.documentElement.outerHTML;   // read before anything changes the page
+const canvas = document.querySelector("canvas");
+const ctx = canvas.getContext("2d");
+const hint = document.querySelector(".hint");
+const page = document.createElement("canvas");       // the text, repainted cell by cell
+const pg = page.getContext("2d");
+const lens = document.createElement("canvas");       // the glow under the brush
+const lx = lens.getContext("2d");
+const FONT = (px) => `${px}px ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+const TEXT = SOURCE.replace(/[^\x21-\x7e]+/g, " ").trim();   // printable ascii, single spaces
+const CHARS = Array.from({ length: 127 }, (_, i) => String.fromCharCode(i));
+const COUNT = new Float64Array(127);  // how often each glyph turns up in TEXT
+for (let i = 0; i < TEXT.length; i++) COUNT[TEXT.charCodeAt(i)]++;
+const SPACE = 32;
+const RATE = 200;            // sort steps per second
+const TAU = 1.1;             // s for the heat behind the brush to die down
+const FLASH = 0.5;           // s for a swapped glyph to fade from red
+const SHADES = 24, TINTS = 8;
+const BASE = 64;             // grey of text the brush hasn't touched
+const coarse = matchMedia("(pointer: coarse)").matches;
+
+// STYLE[shade][tint]: the grey for a glyph's ink, pulled toward red by tint
+const mix = (v, f) => `rgb(${[255, 42, 31].map((r) => Math.round(v + (r - v) * f)).join(",")})`;
+const STYLE = Array.from({ length: SHADES }, (_, s) =>
+  Array.from({ length: TINTS + 1 }, (_, t) => mix(Math.round(40 + (215 * s) / (SHADES - 1)), t / TINTS)));
+const PLAIN = mix(BASE, 0);
+const FLY = Array.from({ length: TINTS + 1 }, (_, t) => mix(BASE, 1 - t / TINTS));   // red -> plain
+const flying = FLY.map(() => []);
+
+const ink = new Float32Array(127);     // 0 for a space .. 1 for the heaviest glyph
+const shade = new Uint8Array(127);
+
+let W, H, dpr, fs, CW, CH, cols, rows, N, BR, fade;
+let glyph, home, heat, ux, uy, touched, flashAt, queued, arriving;
+let queue = [];                         // cells to repaint; swapped ones stay while they fade
+let flyers = [];                        // glyphs on their way home
+let now = 0, last = 0, acc = 0, parity = 0;
+let ghost = { t0: -1, x: null, y: null };   // one slow stroke on load, until someone touches it
+let tap = { t: -1, x: 0, y: 0 };
+const brush = { down: false, over: false, id: -1, x: 0, y: 0, lx: 0, ly: 0, dx: 0, dy: 1 };
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = page.width = W * dpr; canvas.height = page.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  pg.setTransform(dpr, 0, 0, dpr, 0, 0);
+  fs = Math.max(11, Math.min(14, Math.round(Math.min(W, H) / 55)));
+  ctx.font = pg.font = FONT(fs);
+  ctx.textAlign = pg.textAlign = "center";
+  ctx.textBaseline = pg.textBaseline = "middle";
+  CW = Math.ceil(pg.measureText("M").width);
+  CH = Math.round(fs * 1.3);
+  cols = Math.ceil(W / CW); rows = Math.ceil(H / CH); N = cols * rows;
+  BR = Math.round(Math.max(30, Math.min(64, Math.min(W, H) * 0.075)));
+  const s = (lens.width = lens.height = Math.ceil(2 * BR * dpr));
+  fade = lx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  fade.addColorStop(0, "#000"); fade.addColorStop(0.5, "rgba(0,0,0,.7)"); fade.addColorStop(1, "rgba(0,0,0,0)");
+  measureInk();
+
+  glyph = new Uint8Array(N); home = new Int32Array(N);
+  heat = new Float32Array(N); ux = new Float32Array(N); uy = new Float32Array(N);
+  touched = new Uint8Array(N); queued = new Uint8Array(N); arriving = new Uint8Array(N);
+  flashAt = new Float64Array(N).fill(-1);
+  for (let k = 0; k < N; k++) { glyph[k] = TEXT.charCodeAt(k % TEXT.length); home[k] = k; }
+  queue = []; flyers = [];
+  paintAll();
+}
+
+// Ink = alpha summed over the glyph's cell, all 95 glyphs drawn side by side once.
+function measureInk() {
+  const s = 3, w = CW * s, h = CH * s;
+  const c = document.createElement("canvas");
+  c.width = w * 95; c.height = h;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.font = FONT(fs * s);
+  g.textAlign = "center"; g.textBaseline = "middle"; g.fillStyle = "#fff";
+  for (let i = 32; i < 127; i++) g.fillText(CHARS[i], (i - 32 + 0.5) * w, h / 2);
+  const px = g.getImageData(0, 0, c.width, h).data;
+  let max = 0;
+  for (let i = 32; i < 127; i++) {
+    let sum = 0;
+    for (let y = 0; y < h; y++)
+      for (let x = (i - 32) * w, e = x + w; x < e; x++) sum += px[(y * c.width + x) * 4 + 3];
+    ink[i] = sum;
+    max = Math.max(max, sum);
+  }
+  for (let i = 32; i < 127; i++) ink[i] /= max;
+
+  // Shade by rank among the glyphs on the page rather than by raw ink (most
+  // letters have about the same), so a sorted run reads as an even ramp.
+  const order = CHARS.slice(33).map((_, i) => i + 33).sort((a, b) => ink[a] - ink[b]);
+  const total = order.reduce((n, c) => n + COUNT[c], 0);
+  let below = 0;
+  for (const c of order) {
+    shade[c] = Math.round(((below + COUNT[c] / 2) / total) * (SHADES - 1));
+    below += COUNT[c];
+  }
+}
+
+// ---- painting ---------------------------------------------------------------
+
+// Redraw one cell on the page; true while it's still fading from red.
+function paint(k) {
+  const x = (k % cols) * CW, y = ((k / cols) | 0) * CH, g = glyph[k];
+  pg.fillStyle = "#000";
+  pg.fillRect(x, y, CW, CH);
+  if (g === SPACE || arriving[k]) return false;
+  const f = flashAt[k] < 0 ? 0 : 1 - (now - flashAt[k]) / FLASH;
+  pg.fillStyle = touched[k] ? STYLE[shade[g]][f > 0 ? Math.ceil(f * TINTS) : 0] : PLAIN;
+  pg.fillText(CHARS[g], x + CW / 2, y + CH / 2);
+  return f > 0;
+}
+
+function paintAll() {
+  pg.fillStyle = "#000";
+  pg.fillRect(0, 0, W, H);
+  pg.fillStyle = PLAIN;
+  for (let k = 0; k < N; k++) {
+    const g = glyph[k];
+    if (g === SPACE || arriving[k] || touched[k]) continue;
+    pg.fillText(CHARS[g], (k % cols) * CW + CW / 2, ((k / cols) | 0) * CH + CH / 2);
+  }
+  for (let k = 0; k < N; k++) if (touched[k]) paint(k);
+}
+
+function mark(k) {
+  if (!queued[k]) { queued[k] = 1; queue.push(k); }
+}
+
+function repaint() {
+  const keep = [];
+  for (const k of queue) {
+    if (paint(k)) keep.push(k);
+    else queued[k] = 0;
+  }
+  queue = keep;
+}
+
+// The brush only brightens what's under it: the page, masked to a soft disc, added on top.
+function glow(x, y, a) {
+  const s = lens.width, sx = Math.round((x - BR) * dpr), sy = Math.round((y - BR) * dpr);
+  const x0 = Math.max(0, sx), y0 = Math.max(0, sy);
+  const x1 = Math.min(page.width, sx + s), y1 = Math.min(page.height, sy + s);
+  if (x1 <= x0 || y1 <= y0) return;
+  lx.globalCompositeOperation = "source-over";
+  lx.clearRect(0, 0, s, s);
+  lx.drawImage(page, x0, y0, x1 - x0, y1 - y0, x0 - sx, y0 - sy, x1 - x0, y1 - y0);
+  lx.globalCompositeOperation = "destination-in";
+  lx.fillStyle = fade;
+  lx.fillRect(0, 0, s, s);
+  ctx.globalCompositeOperation = "lighter";
+  ctx.globalAlpha = a;
+  ctx.drawImage(lens, sx / dpr, sy / dpr, s / dpr, s / dpr);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// ---- sorting ----------------------------------------------------------------
+
+// Warm the cells under a brush at (px, py) and point them along (dx, dy).
+function heatDisc(px, py, dx, dy) {
+  const r2 = BR * BR;
+  const i0 = Math.max(0, Math.floor((px - BR) / CW)), i1 = Math.min(cols - 1, Math.floor((px + BR) / CW));
+  const j0 = Math.max(0, Math.floor((py - BR) / CH)), j1 = Math.min(rows - 1, Math.floor((py + BR) / CH));
+  for (let j = j0; j <= j1; j++) {
+    const yy = (j + 0.5) * CH - py;
+    for (let i = i0; i <= i1; i++) {
+      const xx = (i + 0.5) * CW - px, d2 = xx * xx + yy * yy;
+      if (d2 >= r2) continue;
+      const h = Math.min(1, 1.5 * (1 - d2 / r2)), k = j * cols + i;
+      if (h > heat[k]) { heat[k] = h; ux[k] = dx; uy[k] = dy; }
+      if (!touched[k] && h > 0.2) { touched[k] = 1; mark(k); }
+    }
+  }
+}
+
+function sweep(x0, y0, x1, y1, dx, dy) {
+  const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / (BR * 0.3)));
+  for (let s = 1; s <= n; s++) heatDisc(x0 + ((x1 - x0) * s) / n, y0 + ((y1 - y0) * s) / n, dx, dy);
+}
+
+function cool(dt) {
+  const f = Math.exp(-dt / TAU);
+  for (let k = 0; k < N; k++) {
+    if (heat[k] === 0) continue;
+    heat[k] *= f;
+    if (heat[k] < 0.03) heat[k] = 0;
+  }
+}
+
+function swap(a, b) {
+  const g = glyph[a]; glyph[a] = glyph[b]; glyph[b] = g;
+  const h = home[a]; home[a] = home[b]; home[b] = h;
+  flashAt[a] = flashAt[b] = now;
+  touched[a] = touched[b] = 1;
+  mark(a); mark(b);
+}
+
+// One odd-even step along rows, then along columns. A warm pair swaps when it's
+// out of order for the way the brush was going, more often the warmer it is.
+function sortStep() {
+  const p = parity;
+  parity ^= 1;
+  for (let j = 0; j < rows; j++) {
+    for (let a = j * cols + p, end = (j + 1) * cols - 1; a < end; a += 2) {
+      const b = a + 1, h = Math.min(heat[a], heat[b]);
+      if (h === 0) continue;
+      const v = ux[a] + ux[b], d = ink[glyph[a]] - ink[glyph[b]];
+      if ((v > 0 ? d > 0 : v < 0 && d < 0) && Math.random() < h * Math.abs(v) * 0.5) swap(a, b);
+    }
+  }
+  for (let j = p; j < rows - 1; j += 2) {
+    for (let a = j * cols, end = a + cols; a < end; a++) {
+      const b = a + cols, h = Math.min(heat[a], heat[b]);
+      if (h === 0) continue;
+      const v = uy[a] + uy[b], d = ink[glyph[a]] - ink[glyph[b]];
+      if ((v > 0 ? d > 0 : v < 0 && d < 0) && Math.random() < h * Math.abs(v) * 0.5) swap(a, b);
+    }
+  }
+}
+
+// ---- restoring --------------------------------------------------------------
+
+// Every glyph knows its home cell. Put them all back, and let the ones that
+// moved fly there; their cells stay blank until they land.
+function restore() {
+  settle();
+  const was = glyph;
+  glyph = new Uint8Array(N);
+  for (let k = 0; k < N; k++) {
+    const h = home[k];
+    glyph[h] = was[k];
+    if (h === k || was[k] === SPACE) continue;
+    const x0 = ((k % cols) + 0.5) * CW, y0 = (((k / cols) | 0) + 0.5) * CH;
+    const x1 = ((h % cols) + 0.5) * CW, y1 = (((h / cols) | 0) + 0.5) * CH;
+    const dur = 0.5 + Math.min(0.7, Math.hypot(x1 - x0, y1 - y0) / 900);
+    flyers.push({ g: was[k], to: h, x0, y0, x1, y1, t0: now + Math.random() * 0.3, dur });
+    arriving[h] = 1;
+  }
+  for (let k = 0; k < N; k++) home[k] = k;
+  heat.fill(0); touched.fill(0); flashAt.fill(-1);
+  for (const k of queue) queued[k] = 0;
+  queue = [];
+  ghost = null;
+  paintAll();
+}
+
+// Land anything still in the air, now.
+function settle() {
+  if (!flyers.length) return;
+  for (const f of flyers) arriving[f.to] = 0;
+  flyers = [];
+  paintAll();
+}
+
+function land() {
+  if (!flyers.length) return;
+  flyers = flyers.filter((f) => {
+    if (now < f.t0 + f.dur) return true;
+    arriving[f.to] = 0;
+    mark(f.to);
+    return false;
+  });
+}
+
+function drawFlyers() {
+  if (!flyers.length) return;
+  for (const f of flyers) {
+    const t = Math.max(0, (now - f.t0) / f.dur), e = t * t * (3 - 2 * t);
+    flying[Math.round(t * TINTS)].push(CHARS[f.g], f.x0 + (f.x1 - f.x0) * e, f.y0 + (f.y1 - f.y0) * e);
+  }
+  flying.forEach((b, i) => {
+    ctx.fillStyle = FLY[i];
+    for (let j = 0; j < b.length; j += 3) ctx.fillText(b[j], b[j + 1], b[j + 2]);
+    b.length = 0;
+  });
+}
+
+// ---- frame ------------------------------------------------------------------
+
+function runGhost() {
+  if (ghost.t0 < 0) ghost.t0 = now + 0.5;
+  const u = (now - ghost.t0) / 2.6;
+  if (u > 1.25) { ghost = null; return; }
+  if (u < 0) return;
+  const v = Math.min(1, u);
+  const x = W * (0.12 + 0.74 * v), y = H * (0.5 + 0.06 * Math.sin(v * 2 * Math.PI));
+  const dx = 0.74 * W, dy = 0.12 * Math.PI * H * Math.cos(v * 2 * Math.PI), d = Math.hypot(dx, dy);
+  sweep(ghost.x ?? x, ghost.y ?? y, x, y, dx / d, dy / d);
+  ghost.x = x; ghost.y = y;
+}
+
+function frame(ms) {
+  now = ms / 1000;
+  const dt = Math.min(0.05, now - last || 0);
+  last = now;
+  cool(dt);
+  if (ghost) runGhost();
+  if (brush.down) {
+    sweep(brush.lx, brush.ly, brush.x, brush.y, brush.dx, brush.dy);
+    brush.lx = brush.x; brush.ly = brush.y;
+  }
+  acc = Math.min(acc + dt * RATE, 8);
+  for (; acc >= 1; acc--) sortStep();
+  land();
+  repaint();
+
+  ctx.drawImage(page, 0, 0, W, H);
+  if (brush.down || brush.over) glow(brush.x, brush.y, brush.down ? 0.9 : 0.5);
+  else if (ghost && ghost.x !== null) glow(ghost.x, ghost.y, 0.9);
+  drawFlyers();
+  requestAnimationFrame(frame);
+}
+
+// ---- input ------------------------------------------------------------------
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (brush.down) return;
+  ghost = null;
+  settle();
+  if (e.pointerType !== "mouse") {
+    const t = performance.now() / 1000;
+    const again = t - tap.t < 0.35 && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 40;
+    tap = { t: again ? -1 : t, x: e.clientX, y: e.clientY };
+    if (again) { restore(); return; }
+  }
+  canvas.setPointerCapture(e.pointerId);
+  // until it moves, a brush pushes down: the heavy glyphs sink
+  Object.assign(brush, { down: true, over: true, id: e.pointerId, x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, dx: 0, dy: 1 });
+});
+
+canvas.addEventListener("pointermove", (e) => {
+  if (brush.down && e.pointerId !== brush.id) return;
+  const mx = e.clientX - brush.x, my = e.clientY - brush.y, m = Math.hypot(mx, my);
+  if (brush.down && m > 0.5) {
+    let dx = brush.dx + mx / m, dy = brush.dy + my / m;
+    const l = Math.hypot(dx, dy);
+    if (l < 0.5) { dx = mx / m; dy = my / m; } else { dx /= l; dy /= l; }   // sharp reversals
+    brush.dx = dx; brush.dy = dy;
+  }
+  brush.x = e.clientX; brush.y = e.clientY;
+  brush.over = brush.down || e.pointerType === "mouse";
+});
+
+function lift(e) {
+  if (e.pointerId !== brush.id) return;
+  brush.down = false; brush.id = -1;
+  if (e.pointerType !== "mouse") brush.over = false;
+}
+canvas.addEventListener("pointerup", lift);
+canvas.addEventListener("pointercancel", lift);
+canvas.addEventListener("pointerleave", () => { if (!brush.down) brush.over = false; });
+
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "Escape") restore();
+});
+
+if (coarse) hint.textContent = "drag to sort · double-tap to restore";
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(resize, 150); });
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
