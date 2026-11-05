@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>peal — 2026-11-04</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; cursor: ns-resize; touch-action: none; }
+  .label, .hint {
+    position: fixed; left: 16px; padding: 2px 6px; background: #000; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label { top: 14px; }
+  .hint { bottom: 14px; color: #444; pointer-events: none; }
+  .hint b { font-weight: normal; color: #ff2a1f; }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+</style>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-11-04 / peal</div>
+<div class="hint"><span id="sound"><b>tap to hear</b> · </span><span id="how">move to steer</span></div>
+<canvas></canvas>
+<script>
+// Change ringing on eight bells, drawn as a braid. Every row each bell rings
+// once, top lane first, and from one row to the next a bell can only swap with
+// a neighbour or stay put, so the band walks through permutations by crossing
+// pairs. Which pairs cross comes from a method in place notation: "x" means
+// every pair crosses, "14" means the bells in 1st and 4th place stay and the
+// rest cross. Each bell's path is drawn in its digit and slashes, and every
+// crossing is an X. The red bell follows the cursor up and down one place per
+// row, which is as fast as a bell can move; the dim rows on the right are where
+// everyone goes next if you hold still. Click a line to take that bell instead.
+const canvas = document.querySelector("canvas");
+const ctx = canvas.getContext("2d");
+const soundEl = document.getElementById("sound");
+const howEl = document.getElementById("how");
+const FONT = (px) => `${px}px ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+const N = 8;                        // bells
+const BELLS = "12345678";
+const BEAT = 0.14;                  // s between blows
+const LOOKAHEAD = 0.12;             // s of rows scheduled ahead
+const IDLE = 5;                     // s without input before the red bell rejoins the method
+const KEEP = 240;                   // rows of history kept
+const coarse = matchMedia("(pointer: coarse)").matches;
+
+// Five standard Major methods, rung spliced: a different one each lead.
+const METHODS = [
+  "&x18x18x18x18,12",                    // Plain Bob
+  "&x38x14x1258x36x14x58x16x78,12",      // Cambridge Surprise
+  "&x38x14x58x16x12x38x14x78,12",        // Yorkshire Surprise
+  "&x58x14.58x58.36.14x14.58x14x18,18",  // Bristol Surprise
+  "&x14x36x58x18,18",                    // Double Norwich Court Bob
+].map(expand);
+
+// Place notation -> one bitmask per change, bit i set when places i and i+1
+// (from 0) swap. "&a,b" is a palindrome: a, then a backwards without its last
+// change, then the lead end b.
+function expand(pn) {
+  const [a, b] = pn.slice(1).split(",").map((s) => s.match(/x|\d+/g));
+  return [...a, ...a.slice(0, -1).reverse(), ...b].map((tok) => {
+    const stay = tok === "x" ? [] : [...tok].map((d) => d - 1);
+    let mask = 0;
+    for (let i = 0; i < N - 1; i++) {
+      if (stay.includes(i) || stay.includes(i + 1)) continue;
+      mask |= 1 << i;
+      i++;
+    }
+    return mask;
+  });
+}
+
+// The composition: a few rows of rounds, then the methods in a shuffled cycle.
+const order = [0, 1, 2, 3, 4];
+for (let i = order.length - 1; i > 0; i--) {
+  const j = Math.floor(Math.random() * (i + 1));
+  [order[i], order[j]] = [order[j], order[i]];
+}
+const composition = [0, 0, 0, 0];
+let leads = 0;
+function notation(n) {
+  while (composition.length <= n) composition.push(...METHODS[order[leads++ % order.length]]);
+  return composition[n];
+}
+
+// ---- rows -------------------------------------------------------------------
+
+function ring(row, mask) {
+  const out = row.slice();
+  for (let i = 0; i < N - 1; i++) if ((mask >> i) & 1) { out[i] = row[i + 1]; out[i + 1] = row[i]; }
+  return out;
+}
+
+// Bend a change so `bell` moves one place toward `to`: it joins a pair (or
+// keeps out of one), and whatever pairs that overlaps are broken into places.
+function steer(mask, row, bell, to) {
+  const p = row.indexOf(bell), d = Math.sign(to - p);
+  if (d === 0) return mask & ~(1 << p) & ~(p > 0 ? 1 << (p - 1) : 0);
+  const i = d > 0 ? p : p - 1;
+  return (mask & ~(1 << (i + 1)) & ~(i > 0 ? 1 << (i - 1) : 0)) | (1 << i);
+}
+
+function makeRow(row, n, t0, dur) {
+  const pos = new Uint8Array(N);
+  for (let p = 0; p < N; p++) pos[row[p]] = p;
+  return { row, pos, n, t0, dur };
+}
+
+let rows = [];                      // rung and scheduled rows, oldest first
+let next = 0, nextT = 0;            // number and start time of the next row to schedule
+let red = 0;                        // the bell you steer; 0 is the treble
+let want = null, lastInput = -Infinity;
+let audio = null, muted = false;
+const wall = () => performance.now() / 1000;
+const clock = () => (audio && audio.ready ? audio.ctx.currentTime : wall());
+const steering = () => want !== null && wall() - lastInput < IDLE;
+
+function nextRow(prev, n) {
+  let mask = notation(n);
+  if (steering()) mask = steer(mask, prev, red, want);
+  return ring(prev, mask);
+}
+
+// Arrive mid-peal: rounds, then enough of the methods already rung to fill the screen.
+let rung = Uint8Array.from({ length: N }, (_, i) => i);
+for (; next < 160; next++) rows.push(makeRow((rung = ring(rung, notation(next))), next, -Infinity, 1));
+
+function schedule() {
+  const now = clock();
+  if (nextT < now) nextT = now + 0.03;            // fell behind (hidden tab): carry on from here
+  while (nextT < now + LOOKAHEAD) {
+    const dur = (next % 2 ? N + 1 : N) * BEAT;     // the handstroke gap comes after each backstroke
+    const r = makeRow(nextRow(rows[rows.length - 1].row, next), next, nextT, dur);
+    rows.push(r);
+    if (audio && audio.ready) for (let p = 0; p < N; p++) strike(r.row[p], nextT + p * BEAT);
+    next++;
+    nextT += dur;
+  }
+  if (rows.length > KEEP) rows.splice(0, rows.length - KEEP);
+}
+
+// The rows after the scheduled ones, as they'll go if nothing changes.
+function predict(upto) {
+  const out = [];
+  let r = rows[rows.length - 1].row;
+  for (let n = next; n <= upto; n++) out.push(makeRow((r = nextRow(r, n)), n, Infinity, 1));
+  return out;
+}
+
+// ---- sound ------------------------------------------------------------------
+
+// Tuned to a major scale, treble G4 down to tenor G3. These are the primes;
+// the nominal an octave up is what you mostly hear.
+const hz = (b) => 196 * 2 ** ([12, 11, 9, 7, 5, 4, 2, 0][b] / 12);
+
+// [ratio to the prime, amplitude, decay in s at 400 Hz]: hum, prime, tierce (a
+// minor third), quint, nominal and a few upper partials, with the hum and the
+// nominal split in two so they beat slowly, and a short clang on top.
+const PARTIALS = [
+  [0.5, 0.4, 3.2], [0.5012, 0.25, 3.2], [1, 0.35, 2.3], [1.19, 0.45, 1.8], [1.5, 0.15, 1.1],
+  [2, 0.6, 1.6], [2.004, 0.25, 1.6], [2.51, 0.2, 0.8], [2.66, 0.14, 0.6], [3.01, 0.12, 0.5],
+  [4.07, 0.09, 0.3], [5.43, 0.08, 0.06], [6.79, 0.06, 0.04],
+];
+
+function bellBuffer(ac, f) {
+  const sr = ac.sampleRate, len = Math.floor(sr * 4.5);
+  const buf = ac.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  const stretch = Math.sqrt(400 / f);              // bigger bells ring longer
+  for (const [ratio, amp, tau] of PARTIALS) {
+    const w = (2 * Math.PI * f * ratio) / sr;
+    if (w > 0.9 * Math.PI) continue;
+    // amp * r^i * sin(w * i), a decaying sine, by a two-pole recurrence
+    const r = Math.exp(-1 / (tau * stretch * sr)), c = 2 * r * Math.cos(w), r2 = r * r;
+    let y1 = amp * r * Math.sin(w), y2 = 0;
+    d[1] += y1;
+    for (let i = 2; i < len; i++) { const y = c * y1 - r2 * y2; d[i] += y; y2 = y1; y1 = y; }
+  }
+  let peak = 0;
+  for (let i = 0; i < len; i++) peak = Math.max(peak, Math.abs(d[i]));
+  const tail = Math.floor(sr * 0.5);
+  for (let i = 0; i < len; i++) d[i] *= Math.min(1, (len - i) / tail) / peak;
+  return buf;
+}
+
+// The tower: a few seconds of noise that darkens as it dies away.
+function room(ac, secs) {
+  const sr = ac.sampleRate, len = Math.floor(sr * secs), buf = ac.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    let lp = 0;
+    for (let i = 0; i < len; i++) {
+      const u = i / len;
+      lp += (Math.random() * 2 - 1 - lp) * (0.5 - 0.42 * u);
+      d[i] = lp * Math.exp(-6 * u);
+    }
+  }
+  return buf;
+}
+
+function startAudio() {
+  if (audio) { if (audio.ctx.state !== "running") audio.ctx.resume().catch(() => {}); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { soundEl.style.display = "none"; return; }
+  const ac = new AC();
+  const master = ac.createGain();
+  master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.ratio.value = 4;
+  master.connect(comp).connect(ac.destination);
+  const verb = ac.createConvolver();
+  verb.buffer = room(ac, 2.6);
+  const wet = ac.createGain();
+  wet.gain.value = 0.3;
+  verb.connect(wet).connect(comp);
+  // the bells hang in a circle, so they come from all round
+  const bells = [];
+  for (let b = 0; b < N; b++) {
+    const pan = ac.createStereoPanner();
+    pan.pan.value = 0.6 * Math.sin((2 * Math.PI * (b + 0.5)) / N);
+    pan.connect(master);
+    pan.connect(verb);
+    bells.push({ buf: bellBuffer(ac, hz(b)), out: pan });
+  }
+  audio = { ctx: ac, master, bells, ready: false };
+  ac.resume().then(() => {
+    // carry on from the silent clock onto the audio clock
+    const d = ac.currentTime - wall();
+    for (const r of rows) r.t0 += d;
+    nextT += d;
+    audio.ready = true;
+    for (const r of rows)
+      for (let p = 0; p < N; p++) if (r.t0 + p * BEAT > ac.currentTime) strike(r.row[p], r.t0 + p * BEAT);
+    setSound();
+  }).catch(() => {});
+}
+
+function strike(b, t) {
+  const ac = audio.ctx, s = ac.createBufferSource(), g = ac.createGain();
+  s.buffer = audio.bells[b].buf;
+  g.gain.value = 0.22 * (0.85 + 0.3 * Math.random());
+  s.connect(g).connect(audio.bells[b].out);
+  s.start(Math.max(ac.currentTime, t + (Math.random() - 0.5) * 0.01));   // no band is quite even
+}
+
+function setSound() {
+  if (audio) audio.master.gain.setTargetAtTime(muted ? 0 : 0.8, audio.ctx.currentTime, 0.05);
+  soundEl.firstChild.textContent = muted ? "muted (m)" : "tap to hear";
+  soundEl.style.display = audio && audio.ready && !muted ? "none" : "";
+}
+
+// ---- drawing ----------------------------------------------------------------
+
+let W, H, fs, CW, CH, K, y0, xNow;
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // lanes K text rows apart and rows K columns apart, so a crossing is a clean X
+  // of slashes; on short screens just the X
+  K = 4;
+  let f = (H * 0.64) / ((N - 1) * K) / 1.2;
+  if (f < 10) { K = 2; f *= 2; }
+  fs = Math.round(Math.max(10, Math.min(20, f)));
+  CH = Math.round(fs * 1.2);
+  ctx.font = FONT(fs);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  CW = ctx.measureText("M").width;
+  y0 = Math.round((H - (N - 1) * K * CH) / 2);
+  xNow = Math.round(W * (W < 600 ? 0.7 : 0.78));
+  howEl.textContent = coarse ? "drag to steer" : "move to steer";
+}
+
+// palette: 0..15 greys, 16..25 reds
+const PAL = [];
+for (let i = 0; i < 16; i++) { const v = Math.round(16 + 239 * (i / 15) ** 1.5); PAL.push(`rgb(${v},${v},${v})`); }
+for (let i = 0; i < 10; i++) PAL.push(`rgba(255,42,31,${(0.12 + (0.88 * i) / 9).toFixed(3)})`);
+const GREY = (t) => Math.max(0, Math.min(15, Math.round(t * 15)));
+const REDS = (t) => 16 + Math.max(0, Math.min(9, Math.round(t * 9)));
+const buckets = PAL.map(() => []);
+const put = (c, ch, x, y) => { if (x > -CW && x < W + CW) buckets[c].push(ch, x, y); };
+const laneY = (j) => y0 + j * K * CH;
+
+// Palette index for a glyph of bell b at x that lands (rings) at time ts.
+// kind: 0 digit, 1 path, 2 crossing
+function tone(kind, b, x, ts, now) {
+  if (ts > now) {                                  // still to come: dim, fading to the right
+    const f = Math.max(0, 1 - (x - xNow) / (W - xNow + 1));
+    return b === red ? REDS(0.1 + 0.35 * f) : GREY((kind ? 0.13 : 0.2) * (0.4 + 0.6 * f));
+  }
+  const a = Math.max(0, Math.min(1, x / xNow));    // older rows fade out to the left
+  const flash = Math.exp(-(now - ts) / 0.22);
+  if (b === red) return kind === 0 && flash > 0.4 ? 15 : REDS(0.1 + 0.9 * a);
+  const base = [0.22 + 0.52 * a, 0.08 + 0.34 * a, 0.14 + 0.44 * a][kind];
+  return GREY(base + flash * (kind ? 0.2 : 0.6));
+}
+
+let seq = [], T = 0;                // rows on screen (rung, scheduled, predicted), and where now is
+
+function frame() {
+  schedule();
+  // draw what's reaching the speakers now, not what the audio clock has just sent
+  const now = clock() - (audio && audio.ready ? audio.ctx.outputLatency || audio.ctx.baseLatency || 0 : 0);
+  let cur = rows[0];
+  for (let i = rows.length - 1; i >= 0; i--) if (rows[i].t0 <= now) { cur = rows[i]; break; }
+  T = cur.n + Math.min(1, (now - cur.t0) / cur.dur);
+  const step = K * CW;
+  const n0 = Math.max(rows[0].n, Math.floor(T - xNow / step) - 1);
+  const n1 = Math.ceil(T + (W - xNow) / step) + 1;
+  seq = rows.slice(n0 - rows[0].n).concat(predict(n1));
+
+  for (let i = 0; i < seq.length; i++) {
+    const A = seq[i], B = seq[i + 1], xa = xNow - (T - A.n) * step;
+    for (let j = 0; j < N; j++) {
+      const b = A.row[j], y = laneY(j);
+      put(tone(0, b, xa, A.t0 + j * BEAT, now), BELLS[b], xa, y);
+      if (!B) continue;
+      const j2 = B.pos[b], dj = j2 - j, ts = B.t0 + j2 * BEAT;
+      for (let m = 1; m < K; m++) {
+        const x = xa + m * CW, yy = y + dj * m * CH;
+        if (dj && m === K / 2) {                   // the crossing, drawn once from the upper bell
+          if (dj > 0) put(tone(2, A.row[j + 1] === red ? red : b, x, B.t0 + j * BEAT, now), "X", x, yy);
+          continue;
+        }
+        put(tone(1, b, x, ts, now), dj === 0 ? "-" : dj > 0 ? "\\" : "/", x, yy);
+      }
+    }
+  }
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  buckets.forEach((bk, c) => {
+    if (!bk.length) return;
+    ctx.fillStyle = PAL[c];
+    for (let k = 0; k < bk.length; k += 3) ctx.fillText(bk[k], bk[k + 1], bk[k + 2]);
+    bk.length = 0;
+  });
+  requestAnimationFrame(frame);
+}
+
+// ---- input ------------------------------------------------------------------
+
+const laneAt = (y) => Math.max(0, Math.min(N - 1, Math.round((y - y0) / (K * CH))));
+
+// The bell whose line passes closest to (x, y), if one is near.
+function bellAt(x, y) {
+  if (!seq.length) return null;
+  const u = T - (xNow - x) / (K * CW), i = Math.floor(u) - seq[0].n, f = u - Math.floor(u);
+  const A = seq[i], B = seq[i + 1] || A;
+  if (!A) return null;
+  let best = null, dist = K * CH * 0.5;
+  for (let b = 0; b < N; b++) {
+    const ya = laneY(A.pos[b]), d = Math.abs(ya + (laneY(B.pos[b]) - ya) * f - y);
+    if (d < dist) { dist = d; best = b; }
+  }
+  return best;
+}
+
+let down = null;
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "mouse") startAudio();     // a touch only counts as a gesture when it lifts
+  const b = bellAt(e.clientX, e.clientY);
+  if (b !== null) red = b;
+  down = e.pointerId;
+  canvas.setPointerCapture(e.pointerId);
+  want = laneAt(e.clientY);
+  lastInput = wall();
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (e.pointerType !== "mouse" && e.pointerId !== down) return;
+  want = laneAt(e.clientY);
+  lastInput = wall();
+});
+canvas.addEventListener("pointerup", (e) => {
+  if (e.pointerType !== "mouse") startAudio();
+  if (e.pointerId === down) down = null;
+});
+canvas.addEventListener("pointercancel", (e) => { if (e.pointerId === down) down = null; });
+document.documentElement.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") want = null; });
+
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    const from = steering() ? want : rows[rows.length - 1].pos[red];
+    want = Math.max(0, Math.min(N - 1, from + (e.key === "ArrowUp" ? -1 : 1)));
+    lastInput = wall();
+    startAudio();
+  } else if (e.key === "m" || e.key === "M") {
+    if (!audio) startAudio();
+    else { muted = !muted; setSound(); }
+  }
+});
+
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(resize, 150); });
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
