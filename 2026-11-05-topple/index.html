@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>topple — 2026-11-05</title>
+<link rel="icon" href="data:,">
+
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas {
+    display: block; cursor: crosshair; touch-action: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  }
+  .label, .hint {
+    position: fixed; left: 16px; padding: 2px 6px; background: #000; color: #666;
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: lowercase; user-select: none;
+  }
+  .label { top: 14px; }
+  .hint { bottom: 14px; color: #444; pointer-events: none; }
+  .hint b { font-weight: normal; color: #ff2a1f; }
+  .label a { color: inherit; text-decoration: none; }
+  .label a:hover { color: #fff; }
+</style>
+</head>
+<body>
+<div class="label"><a href="../index.html">←</a> 2026-11-05 / topple</div>
+<div class="hint"><span id="sound"><b>tap to hear</b> · </span><span id="how">hold to pour</span></div>
+<canvas></canvas>
+<script>
+// An abelian sandpile, drawn in strokes. A cell holds up to three grains, drawn
+// as strokes through its centre: one is a slash, two an X, three an asterisk.
+// A fourth makes a red star and the cell topples, passing one grain to each of
+// its four neighbours, which may tip over in turn; grains that go over the
+// edge of the screen are lost. Every unstable cell topples at once, a step at
+// a time, so an avalanche works its way through the pile instead of happening
+// in an instant. Whatever order the grains land in, the pile settles the same
+// way, and poured onto one cell it grows into a four-fold fractal. The spout
+// drops a handful each time the pile goes still, until sand falls off the
+// edge; holding moves it and pours a steady stream. The sound is the
+// avalanches: grit gated by how many cells toppled and where, duller the
+// further they are from the spout.
+const canvas = document.querySelector("canvas");
+const ctx = canvas.getContext("2d", { alpha: false });
+const soundEl = document.getElementById("sound");
+const howEl = document.getElementById("how");
+const coarse = matchMedia("(pointer: coarse)").matches;
+
+const CELLS = 14000;      // about this many cells on screen
+const HANDFUL = 600;      // grains the spout drops at a time
+const REST = 0.6;         // s the pile lies still before the next handful
+const POUR0 = 300;        // grains/s when you start holding,
+const POUR = 1200;        // and after RAMP s
+const RAMP = 1.5;
+const STEP_RATE = 360;    // toppling steps/s,
+const KNEE = 400;         // sped up (to 4x) past this many unstable cells so a held pour can't back up
+const WAVE = 0.5;         // s between waves while you hold (each handful is one)
+const FADE = 0.07;        // s, time constant of the red at an avalanche's leading edge
+const L = 8;              // colour steps from grey to red
+const BUCKETS = 4;        // strips of screen, left to right, for the sound
+const RED = "#ff2a1f";
+const INK = ["#000", "#3d3d3d", "#747474", "#d6d6d6", RED];   // by grains in the cell
+
+// ---- the pile ---------------------------------------------------------------
+
+let W = 0, H = 0, dpr = 1, C = 0, cols = 0, rows = 0, ox = 0, oy = 0;
+let h = null;                       // grains per cell
+let heat, drawn, inQ;               // red at the leading edge, sprite on screen, queued
+let mark, wave = 1;                 // the last wave each cell toppled in, and the current one
+let cur, nxt, qs, nc = 0, nn = 0;   // cells to topple this step, and next step
+let spilled = 0;                    // grains lost over the edge since the last frame
+const tally = new Float32Array(BUCKETS);   // topplings per strip since the last frame
+let reach = 0;                      // and their summed distance from the spout
+const spout = { x: 0, y: 0 }, from = { x: 0, y: 0 };
+let holding = false, held = 0, carry = 0;
+let open = true, still = REST - 0.4;   // spout dropping handfuls; s the pile has been still
+
+function add(i, g) {
+  h[i] += g;
+  if (h[i] >= 4 && !inQ[i]) { inQ[i] = 1; cur[nc++] = i; }
+}
+
+function give(j, q) {
+  h[j] += q;
+  if (h[j] >= 4 && !inQ[j]) { inQ[j] = 1; nxt[nn++] = j; }
+}
+
+// One step: every unstable cell topples together (as many times over as it
+// holds fours, so the heap under the spout can't back up), then the cells that
+// went over four are queued for the next step.
+function step() {
+  const m = nc;
+  for (let k = 0; k < m; k++) {
+    const i = cur[k], q = h[i] >> 2;
+    inQ[i] = 0; qs[k] = q; h[i] -= q << 2;
+  }
+  nn = 0;
+  for (let k = 0; k < m; k++) {
+    const q = qs[k];
+    if (!q) continue;
+    const i = cur[k], x = i % cols, y = (i - x) / cols;
+    // A cell goes red the first time it topples in a wave, so what shows is the
+    // edge of the avalanche spreading out, not the churn behind it (a big pile
+    // topples nearly everywhere, many times over, for every handful).
+    if (mark[i] !== wave) { mark[i] = wave; heat[i] = 1; }
+    tally[((x * BUCKETS) / cols) | 0] += q;
+    reach += q * (Math.abs(x - spout.x) + Math.abs(y - spout.y));
+    if (x > 0) give(i - 1, q); else spilled += q;
+    if (x < cols - 1) give(i + 1, q); else spilled += q;
+    if (y > 0) give(i - cols, q); else spilled += q;
+    if (y < rows - 1) give(i + cols, q); else spilled += q;
+  }
+  const t = cur; cur = nxt; nxt = t; nc = nn;
+}
+
+// While you hold, drop this frame's grains, spread along the way if you moved.
+function pour(dt) {
+  let rate = 0;
+  if (holding) {
+    if (Math.floor((held + dt) / WAVE) > Math.floor(held / WAVE)) wave++;
+    held += dt;
+    rate = POUR0 + (POUR - POUR0) * Math.min(1, held / RAMP);
+    carry += rate * dt;
+    const g = Math.floor(carry);
+    carry -= g;
+    const dx = spout.x - from.x, dy = spout.y - from.y;
+    if (g && !dx && !dy) add(spout.y * cols + spout.x, g);
+    else for (let k = 1; k <= g; k++) add(Math.round(from.y + (dy * k) / g) * cols + Math.round(from.x + (dx * k) / g), 1);
+  }
+  from.x = spout.x; from.y = spout.y;
+  return rate;
+}
+
+function clear() {
+  h.fill(0); heat.fill(0); inQ.fill(0); mark.fill(0);
+  nc = 0; carry = 0; open = true; still = REST - 0.3;
+}
+
+// ---- drawing ----------------------------------------------------------------
+
+let atlas = null;
+const rgb = (s) => [1, 3, 5].map((k) => parseInt(s.slice(k, k + 2), 16));
+const mix = (a, b, t) => `rgb(${a.map((v, k) => Math.round(v + (b[k] - v) * t)).join(",")})`;
+
+// Sprites, a row per grain count and a column per step towards red. The strokes
+// arrive in the order / \ | -, so three is an asterisk and four a star.
+function buildAtlas() {
+  atlas = document.createElement("canvas");
+  atlas.width = C * L; atlas.height = C * 5;
+  const a = atlas.getContext("2d"), red = rgb(RED);
+  const r = C * 0.33, d = r * 0.86;
+  a.lineCap = "round";
+  a.lineWidth = Math.max(1, C * 0.085);
+  for (let g = 0; g < 5; g++) {
+    for (let c = 0; c < L; c++) {
+      const x = c * C + C / 2, y = g * C + C / 2;
+      a.strokeStyle = a.fillStyle = mix(rgb(INK[g]), red, c / (L - 1));
+      a.beginPath();
+      if (g === 0) { a.arc(x, y, Math.max(0.75, C * 0.05), 0, 2 * Math.PI); a.fill(); continue; }
+      a.moveTo(x - d, y + d); a.lineTo(x + d, y - d);
+      if (g > 1) { a.moveTo(x - d, y - d); a.lineTo(x + d, y + d); }
+      if (g > 2) { a.moveTo(x, y - r); a.lineTo(x, y + r); }
+      if (g > 3) { a.moveTo(x - r, y); a.lineTo(x + r, y); }
+      a.stroke();
+    }
+  }
+}
+
+// Repaint only the cells whose sprite changed. An empty cell that just toppled
+// shows a red dot while it fades.
+function draw() {
+  ctx.fillStyle = "#000";
+  for (let y = 0, i = 0; y < rows; y++) {
+    const py = oy + y * C;
+    for (let x = 0; x < cols; x++, i++) {
+      const v = h[i];
+      let s;
+      if (v > 3) s = 1 + 4 * L + L - 1;
+      else {
+        const c = Math.round(heat[i] * heat[i] * (L - 1));
+        s = v || c ? 1 + v * L + c : 0;
+      }
+      if (s === drawn[i]) continue;
+      drawn[i] = s;
+      const px = ox + x * C;
+      ctx.fillRect(px, py, C, C);
+      if (s) ctx.drawImage(atlas, ((s - 1) % L) * C, (((s - 1) / L) | 0) * C, C, C, px, py, C, C);
+    }
+  }
+}
+
+function cool(dt) {
+  const k = Math.exp(-dt / FADE);
+  for (let i = 0; i < heat.length; i++) if (heat[i]) heat[i] = heat[i] > 0.02 ? heat[i] * k : 0;
+}
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  const cw = innerWidth, ch = innerHeight;
+  W = Math.round(cw * dpr); H = Math.round(ch * dpr);
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = cw + "px"; canvas.style.height = ch + "px";
+  C = Math.round(Math.max(8, Math.min(14, Math.round(Math.sqrt((cw * ch) / CELLS)))) * dpr);
+  const old = h, oldCols = cols, oldRows = rows;
+  cols = Math.max(1, Math.floor(W / C)); rows = Math.max(1, Math.floor(H / C));
+  ox = (W - cols * C) >> 1; oy = (H - rows * C) >> 1;
+  const n = cols * rows;
+  h = new Int32Array(n); heat = new Float32Array(n); drawn = new Uint8Array(n); inQ = new Uint8Array(n);
+  mark = new Int32Array(n);
+  cur = new Int32Array(n); nxt = new Int32Array(n); qs = new Int32Array(n); nc = 0;
+  if (old) {
+    // keep what's been poured, centre cell to centre cell (so a phone's toolbar
+    // coming and going doesn't walk the pile up the screen)
+    const dx = (cols >> 1) - (oldCols >> 1), dy = (rows >> 1) - (oldRows >> 1);
+    for (let y = Math.max(0, -dy); y < Math.min(oldRows, rows - dy); y++)
+      for (let x = Math.max(0, -dx); x < Math.min(oldCols, cols - dx); x++)
+        if (old[y * oldCols + x]) add((y + dy) * cols + x + dx, old[y * oldCols + x]);
+    spout.x += dx; spout.y += dy;
+  } else {
+    spout.x = cols >> 1; spout.y = rows >> 1;
+  }
+  spout.x = Math.max(0, Math.min(cols - 1, spout.x));
+  spout.y = Math.max(0, Math.min(rows - 1, spout.y));
+  from.x = spout.x; from.y = spout.y;
+  buildAtlas();
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  howEl.textContent = coarse ? "hold to pour" : "hold to pour · esc to clear";
+}
+
+// ---- sound ------------------------------------------------------------------
+
+let audio = null, muted = false;
+
+function noise(ac, secs) {
+  const len = Math.floor(ac.sampleRate * secs), buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
+}
+
+// Grit: a few thousand clicks a second, each a millisecond or so of noise,
+// most of them faint and the odd one loud.
+function grit(ac, secs) {
+  const sr = ac.sampleRate, len = Math.floor(sr * secs), buf = ac.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  let t = 0;
+  for (;;) {
+    t -= Math.log(1 - Math.random()) / 2400;
+    const i0 = Math.floor(t * sr);
+    if (i0 >= len) break;
+    const dur = sr * (0.0003 + 0.0012 * Math.random()), a = Math.random() ** 4;
+    for (let k = 0; k < dur && i0 + k < len; k++) d[i0 + k] += a * (Math.random() * 2 - 1) * Math.exp((-4 * k) / dur);
+  }
+  let sum = 0;
+  for (let i = 0; i < len; i++) sum += d[i] * d[i];
+  const s = 0.2 / Math.sqrt(sum / len || 1);
+  for (let i = 0; i < len; i++) d[i] = Math.max(-1, Math.min(1, d[i] * s));
+  return buf;
+}
+
+function panner(ac, p) {
+  if (!ac.createStereoPanner) return ac.createGain();
+  const node = ac.createStereoPanner();
+  node.pan.value = p;
+  return node;
+}
+
+function startAudio() {
+  if (audio) { if (audio.ctx.state !== "running" && !document.hidden) audio.ctx.resume().catch(() => {}); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ac = null;
+  try { ac = AC ? new AC() : null; } catch (e) { ac = null; }
+  if (!ac) { soundEl.style.display = "none"; return; }
+  const master = ac.createGain();
+  master.gain.value = muted ? 0 : 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 6;
+  master.connect(comp).connect(ac.destination);
+  // the avalanches: a loop of grit per strip, opened by what topples there
+  const buf = grit(ac, 3), slides = [], lps = [];
+  for (let b = 0; b < BUCKETS; b++) {
+    const src = ac.createBufferSource(), lp = ac.createBiquadFilter(), g = ac.createGain();
+    src.buffer = buf; src.loop = true; src.playbackRate.value = 0.9 + 0.07 * b;
+    lp.type = "lowpass"; lp.frequency.value = 3000; lp.Q.value = 0.5;
+    g.gain.value = 0;
+    src.connect(lp).connect(g).connect(panner(ac, ((b + 0.5) / BUCKETS) * 1.6 - 0.8)).connect(master);
+    src.start(0, Math.random() * 3);
+    slides.push(g); lps.push(lp);
+  }
+  // the pour: a thin hiss that follows the spout
+  const hs = ac.createBufferSource(), bp = ac.createBiquadFilter(), hiss = ac.createGain(), hpan = panner(ac, 0);
+  hs.buffer = noise(ac, 2); hs.loop = true;
+  bp.type = "bandpass"; bp.frequency.value = 5200; bp.Q.value = 0.6;
+  hiss.gain.value = 0;
+  hs.connect(bp).connect(hiss).connect(hpan).connect(master);
+  hs.start();
+  audio = { ctx: ac, master, slides, lps, hiss, hpan, noise: hs.buffer, ready: false };
+  ac.resume().then(() => { audio.ready = true; setSound(); }).catch(() => {});
+}
+
+const spoutPan = () => ((spout.x + 0.5) / cols) * 1.6 - 0.8;
+
+// Send a param towards v, unless that's already where it's heading (so a still
+// pile isn't scheduling ten automation events a frame).
+const aims = new WeakMap();
+function glide(p, v, t, tc) {
+  if (aims.has(p) && Math.abs(aims.get(p) - v) < 1e-3) return;
+  aims.set(p, v);
+  p.setTargetAtTime(v, t, tc);
+}
+
+// Each strip's grit opens with the log of how many cells toppled there this
+// frame: one is a faint tick, a couple of thousand a slide.
+function sound(rate) {
+  if (audio && audio.ready) {
+    const t = audio.ctx.currentTime;
+    let total = 0;
+    for (let b = 0; b < BUCKETS; b++) {
+      const v = tally[b];
+      total += v;
+      glide(audio.slides[b].gain, v ? Math.min(1, (1 + Math.log2(v)) / 12) : 0, t, v ? 0.01 : 0.05);
+    }
+    if (total) {
+      const far = Math.min(1, reach / total / (Math.min(cols, rows) / 2));
+      for (const lp of audio.lps) glide(lp.frequency, 4500 * 0.2 ** far, t, 0.05);
+    }
+    glide(audio.hiss.gain, 0.1 * Math.sqrt(rate / POUR), t, 0.05);
+    if (audio.hpan.pan) glide(audio.hpan.pan, spoutPan(), t, 0.05);
+  }
+  tally.fill(0);
+  reach = 0;
+}
+
+// A handful landing: a short, dull pat.
+function thump() {
+  if (!audio || !audio.ready) return;
+  const ac = audio.ctx, t = ac.currentTime;
+  const s = ac.createBufferSource(), lp = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = audio.noise;
+  lp.type = "lowpass"; lp.frequency.value = 420;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.7, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+  s.connect(lp).connect(g).connect(panner(ac, spoutPan())).connect(audio.master);
+  s.start(t, Math.random() * 1.5, 0.25);
+}
+
+function setSound() {
+  if (audio) audio.master.gain.setTargetAtTime(muted ? 0 : 0.8, audio.ctx.currentTime, 0.05);
+  soundEl.firstChild.textContent = muted ? "muted (m)" : "tap to hear";
+  soundEl.style.display = audio && audio.ready && !muted ? "none" : "";
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!audio) return;
+  if (document.hidden) audio.ctx.suspend().catch(() => {});
+  else audio.ctx.resume().catch(() => {});
+});
+
+// ---- loop -------------------------------------------------------------------
+
+let last = 0, acc = 0;
+function frame(now) {
+  const dt = last ? Math.min(0.1, Math.max(0, (now - last) / 1000)) : 0;
+  last = now;
+  const rate = pour(dt);
+  if (!holding && open) {
+    still = nc ? 0 : still + dt;
+    if (still >= REST) { still = 0; wave++; add(spout.y * cols + spout.x, HANDFUL); thump(); }
+  }
+  acc += dt * STEP_RATE * Math.min(4, Math.max(1, nc / KNEE));
+  let k = Math.floor(acc);
+  acc -= k;
+  while (k-- > 0 && nc) step();
+  if (spilled && !holding) open = false;     // it's reached the edge: the spout stops
+  spilled = 0;
+  cool(dt);
+  draw();
+  sound(rate);
+  requestAnimationFrame(frame);
+}
+
+// ---- input ------------------------------------------------------------------
+
+let down = null;
+
+function moveSpout(e) {
+  spout.x = Math.max(0, Math.min(cols - 1, Math.floor((e.clientX * dpr - ox) / C)));
+  spout.y = Math.max(0, Math.min(rows - 1, Math.floor((e.clientY * dpr - oy) / C)));
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (down !== null || (e.pointerType === "mouse" && e.button !== 0)) return;
+  if (e.pointerType === "mouse") startAudio();     // a touch only counts as a gesture when it lifts
+  down = e.pointerId;
+  canvas.setPointerCapture(e.pointerId);
+  moveSpout(e);
+  from.x = spout.x; from.y = spout.y;              // jump there rather than pour a line to it
+  holding = true; held = 0; wave++;
+});
+canvas.addEventListener("pointermove", (e) => { if (e.pointerId === down) moveSpout(e); });
+
+function lift(e) {
+  if (e.pointerId !== down) return;
+  if (e.type === "pointerup" && e.pointerType !== "mouse") startAudio();
+  down = null; holding = false; open = true; still = 0;
+}
+canvas.addEventListener("pointerup", lift);
+canvas.addEventListener("pointercancel", lift);
+canvas.addEventListener("lostpointercapture", lift);
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "Escape") clear();
+  else if (e.key === "m" || e.key === "M") {
+    if (!audio) startAudio();
+    else { muted = !muted; setSound(); }
+  }
+});
+
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(resize, 150); });
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
